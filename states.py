@@ -18,10 +18,15 @@ class AdminOrderEditStates(StatesGroup):
 
 
 class WithdrawStates(StatesGroup):
+    waiting_amount = State()
     waiting_ff_id = State()
 
 
 class WithdrawEdit(StatesGroup):
+    waiting_text = State()
+
+
+class AdminWithdrawEditStates(StatesGroup):
     waiting_text = State()
 
 
@@ -84,9 +89,7 @@ class AdminPromoStates(StatesGroup):
 
 
 class AdminBroadcastStates(StatesGroup):
-    menu = State()
-    waiting_content = State()
-    confirm = State()
+    waiting_message = State()
 
 
 class AdminMainMenuPhotoStates(StatesGroup):

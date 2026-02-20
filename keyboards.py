@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -268,7 +269,7 @@ def promo_enter_keyboard():
             ],
             [
                 InlineKeyboardButton(
-                    text="💳 Balansdagi almazni yechish",
+                    text="📃 Balansdagi almazni yechish",
                     callback_data="withdraw_start"
                 )
             ],

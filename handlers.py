@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from aiogram import Router, F
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import Message, CallbackQuery
@@ -7,9 +8,12 @@ from aiogram.fsm.context import FSMContext
 from config import SUPERADMIN_IDS
 from database import db, utc_now
 import asyncio
+import os
 from datetime import datetime, timedelta, timezone
 import random
 import string
+import re
+from time import perf_counter
 
 from keyboards import prices_back_inline
 
@@ -65,7 +69,7 @@ from states import (
     AdminStates,
     AdminOrderEditStates,
     WithdrawStates,
-    WithdrawEdit,
+    AdminWithdrawEditStates,
     AdminBroadcastStates,
     AdminMainMenuPhotoStates,
     AdminRoleStates,
@@ -78,8 +82,6 @@ from states import (
 from keyboards import (
     bonus_code_menu_keyboard,
     bonus_code_buy_keyboard,
-    admin_broadcast_menu_keyboard,
-    broadcast_confirm_keyboard,
     admin_roles_menu_keyboard,
     admin_payment_cards_menu_keyboard,
     admin_logchat_menu_keyboard,
@@ -119,6 +121,9 @@ ROLE_LABELS = {
 }
 
 ADMIN_NAV_STACK_KEY = "nav_stack"
+ADMIN_TEXT_DEBUG_SEEN: set[int] = set()
+_MOJIBAKE_FRAGMENT_RE = re.compile(r"[\u0400-\u04FF\u0080-\u00FF\u2013\u2014\u2018\u2019\u201C\u201D\u2020\u2021\u2022\u2026\u2030\u2039\u203A\u20AC\u2116\u2122]+")
+BROADCAST_DRY_RUN = os.getenv("BROADCAST_DRY_RUN", "0") == "1"
 
 
 async def get_nav_stack(state: FSMContext) -> list[str]:
@@ -228,6 +233,69 @@ def parse_role(text: str):
     if t in {"3", "viewer", "read", "read-only"}:
         return ADMIN_ROLE_VIEWER
     return None
+
+
+def normalize_menu_text(text: str) -> str:
+    t = (text or "").lower()
+    t = (
+        t.replace("␔", "-")
+        .replace("—", "-")
+        .replace("–", "-")
+        .replace("␘", "'")
+        .replace("␙", "'")
+        .replace("’", "'")
+        .replace("`", "'")
+    )
+    t = re.sub(r"[\U00010000-\U0010ffff]", " ", t)
+    t = re.sub(r"[^a-z0-9а-яёўқғҳ\s'\\-]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def repair_mojibake_text(text: str) -> str:
+    if not text:
+        return text
+    markers = (
+        bytes("\\u0440\\u045f", "ascii").decode("unicode_escape"),
+        bytes("\\u0432\\u0402", "ascii").decode("unicode_escape"),
+        bytes("\\u0432\\u045c", "ascii").decode("unicode_escape"),
+        "O" + bytes("\\u0432\\u0402", "ascii").decode("unicode_escape"),
+    )
+    if not any(marker in text for marker in markers):
+        return text
+
+    def decode_fragment(fragment: str) -> str:
+        raw = bytearray()
+        for ch in fragment:
+            try:
+                encoded = ch.encode("cp1251")
+                if len(encoded) == 1:
+                    raw.extend(encoded)
+                    continue
+            except UnicodeEncodeError:
+                pass
+
+            code = ord(ch)
+            if code <= 255:
+                raw.append(code)
+            else:
+                return fragment
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return fragment
+
+    return _MOJIBAKE_FRAGMENT_RE.sub(lambda m: decode_fragment(m.group(0)), text)
+
+
+def log_admin_text_debug_once(user_id: int, text: str, context: str = "admin_menu") -> None:
+    if user_id in ADMIN_TEXT_DEBUG_SEEN:
+        return
+    ADMIN_TEXT_DEBUG_SEEN.add(user_id)
+    print(
+        f"[ADMIN_TEXT_DEBUG:{context}] user_id={user_id} "
+        f"repr={text!r} utf8={text.encode('utf-8', 'backslashreplace')!r}"
+    )
 
 
 def format_dt_utc5(dt_value) -> str:
@@ -587,6 +655,24 @@ async def update_withdraw_status(request_id: int, status: str, processed_by: int
     )
 
 
+async def mark_withdraw_as_edited(request_id: int, admin_id: int, edited_text: str) -> bool:
+    result = await db.execute(
+        """
+        UPDATE withdraw_requests
+        SET status = 'edited',
+            processed_at = $1,
+            processed_by = $2,
+            note = $3
+        WHERE id = $4 AND status = 'pending'
+        """,
+        utc_now(),
+        admin_id,
+        edited_text,
+        request_id,
+    )
+    return str(result).endswith(" 1")
+
+
 async def add_withdraw_notification(request_id: int, admin_id: int, message_id: int):
     await db.execute(
         """
@@ -730,7 +816,7 @@ async def notify_admins_about_withdraw(bot, request_id: int):
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"wd_ok:{request_id}"),
-                InlineKeyboardButton(text="✏️ Tahrirlash", callback_data=f"wd_edit:{request_id}"),
+                InlineKeyboardButton(text="✏️ Tahrirlash", callback_data=f"withdraw:edit:{request_id}"),
                 InlineKeyboardButton(text="❌ Rad etish", callback_data=f"wd_reject:{request_id}"),
             ]
         ]
@@ -893,7 +979,8 @@ async def require_role(message: Message, roles: tuple[str, ...]):
 
 async def get_setting(key: str, default: str = "") -> str:
     row = await db.fetchrow("SELECT value FROM settings WHERE key = $1", key)
-    return row["value"] if row else default
+    value = row["value"] if row else default
+    return repair_mojibake_text(value)
 
 
 async def set_setting(key: str, value: str) -> None:
@@ -1102,6 +1189,38 @@ def replace_caption_line(caption: str, prefixes: list[str], new_line: str) -> st
 
 def format_money(value: int) -> str:
     return f"{value:,}"
+
+
+def parse_admin_int_input(raw: str) -> int | None:
+    cleaned = (
+        (raw or "")
+        .strip()
+        .replace(" ", "")
+        .replace(",", "")
+        .replace(".", "")
+        .replace("_", "")
+    )
+    if not cleaned or not cleaned.isdigit():
+        return None
+    return int(cleaned)
+
+
+def validate_voucher_numeric_value(field: str, raw: str) -> tuple[int | None, str | None]:
+    value = parse_admin_int_input(raw)
+    if value is None:
+        return None, "❌ Faqat raqam kiriting (masalan: 19000, 19,000 yoki 19 000)"
+
+    if field == "price":
+        if value < 1000 or value > 10_000_000:
+            return None, "❌ Narx 1,000 dan 10,000,000 gacha bo‘lishi kerak"
+        return value, None
+
+    if field == "almaz":
+        if value < 1 or value > 1_000_000:
+            return None, "❌ Almaz miqdori 1 dan 1,000,000 gacha bo‘lishi kerak"
+        return value, None
+
+    return value, None
 
 
 async def create_reminder(user_id: int, order_type: str):
@@ -2175,6 +2294,75 @@ async def users_stats_menu_handler(message: Message):
         f"🗓 30 kun: {month_count}"
     )
 
+
+@router.message(AdminMenuStates.menu)
+async def admin_menu_fallback_router(message: Message, state: FSMContext):
+    role = await get_admin_role(message.from_user.id)
+    if not role:
+        return
+
+    raw = message.text or ""
+    norm = normalize_menu_text(raw)
+    norm_no_quote = norm.replace("'", " ")
+    log_admin_text_debug_once(message.from_user.id, raw, context="admin_menu")
+
+    if not norm:
+        return
+    if "orqaga" in norm:
+        await admin_back_handler(message, state)
+        return
+    if "foydalanuvchi" in norm and "top" in norm:
+        await admin_user_search_start(message, state)
+        return
+    if "foydalanuvchi" in norm and "son" in norm:
+        await users_stats_menu_handler(message)
+        return
+    if "buyurtma" in norm:
+        await admin_orders_menu(message, state)
+        return
+    if "paket" in norm:
+        await admin_packages_menu(message, state)
+        return
+    if "voucher" in norm:
+        await admin_vouchers_menu(message, state)
+        return
+    if "daromad" in norm:
+        await admin_revenue_stats(message)
+        return
+    if "promokod" in norm:
+        await admin_promocode_menu(message, state)
+        return
+    if "admin log" in norm or "loglar" in norm:
+        await admin_logs_view(message)
+        return
+    if "narxlar" in norm and "matn" in norm:
+        await admin_edit_prices(message, state)
+        return
+    if "admin bilan bog" in norm and "matn" in norm:
+        await admin_edit_contact_text(message, state)
+        return
+    if "asosiy menyu rasmi" in norm:
+        await admin_main_menu_photo_start(message, state)
+        return
+    if "asosiy menyu text" in norm:
+        await admin_edit_main_menu_text(message, state)
+        return
+    if "reklama" in norm or "xabar" in norm:
+        await admin_broadcast_menu(message, state)
+        return
+    if ("to'lov" in norm or "to lov" in norm_no_quote) and "karta" in norm:
+        await admin_payment_cards_menu(message, state)
+        return
+    if "kanal" in norm and "ulash" in norm:
+        await admin_logchat_menu(message, state)
+        return
+    if "adminlar" in norm:
+        await admin_roles_menu(message, state)
+        return
+    if "admins statics" in norm or ("admins" in norm and "static" in norm):
+        await admin_stats_menu(message, state)
+        return
+
 @router.message(AdminMenuStates.menu, F.text == "⬅️ Orqaga")
 async def admin_back_handler(message: Message, state: FSMContext):
     await state.clear()
@@ -2234,204 +2422,135 @@ async def admin_main_menu_photo_save(message: Message, state: FSMContext):
 
 @router.message(AdminMenuStates.menu, F.text == "📣 Reklama / Xabar")
 async def admin_broadcast_menu(message: Message, state: FSMContext):
-    role = await require_role(message, (ADMIN_ROLE_SUPER,))
+    role = await require_role(message, (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN))
     if not role:
         return
 
-    await state.set_state(AdminBroadcastStates.menu)
+    await state.set_state(AdminBroadcastStates.waiting_message)
     await message.answer(
-        "📣 <b>REKLAMA / XABAR</b>\n\nTurini tanlang:",
-        reply_markup=admin_broadcast_menu_keyboard()
+        "📣 Reklama rejimi yoqildi.\nEndi xabar yuboring.\nChiqish: ⬅️ Orqaga",
+        reply_markup=back_only_keyboard(),
     )
 
 
-@router.message(AdminBroadcastStates.menu)
-async def admin_broadcast_type(message: Message, state: FSMContext):
-    role = await require_role(message, (ADMIN_ROLE_SUPER,))
-    if not role:
-        return
-
-    if message.text == "⬅️ Orqaga":
-        await state.set_state(AdminMenuStates.menu)
-        await message.answer(
-            "🛠 ADMIN PANEL",
-            reply_markup=admin_menu_keyboard(role)
-        )
-        return
-
-    type_map = {
-        "📝 Matn": "text",
-        "🖼 Rasm": "photo",
-        "🎥 Video": "video",
-        "🎵 Musiqa": "audio",
-        "📎 Fayl": "document",
-        "📊 So‘rovnoma": "poll",
-    }
-    broadcast_type = type_map.get(message.text)
-    if not broadcast_type:
-        await message.answer("❌ Noto‘g‘ri tur. Tugmalardan tanlang.")
-        return
-
-    await state.update_data(broadcast_type=broadcast_type)
-    await state.set_state(AdminBroadcastStates.waiting_content)
-
-    await message.answer(
-        "📤 Endi kontentni yuboring:",
-        reply_markup=remove_keyboard()
-    )
+def detect_broadcast_type(message: Message) -> str:
+    if message.poll:
+        return "poll"
+    if message.sticker:
+        return "sticker"
+    if message.animation:
+        return "animation"
+    if message.video_note:
+        return "video_note"
+    if message.voice:
+        return "voice"
+    if message.video:
+        return "video"
+    if message.photo:
+        return "photo"
+    if message.audio:
+        return "audio"
+    if message.document:
+        return "document"
+    if message.contact:
+        return "contact"
+    if message.location:
+        return "location"
+    if message.text:
+        return "text"
+    return "unknown"
 
 
-@router.message(AdminBroadcastStates.waiting_content)
-async def admin_broadcast_content(message: Message, state: FSMContext):
-    role = await require_role(message, (ADMIN_ROLE_SUPER,))
-    if not role:
-        return
-
-    data = await state.get_data()
-    b_type = data.get("broadcast_type")
-
-    payload = {"type": b_type}
-
-    if b_type == "text":
-        if not message.text:
-            await message.answer("❌ Matn yuboring.")
-            return
-        payload["text"] = message.text
-        await message.answer("📌 Oldindan ko‘rish:\n\n" + message.text)
-
-    elif b_type == "photo":
-        if not message.photo:
-            await message.answer("❌ Rasm yuboring.")
-            return
-        payload["file_id"] = message.photo[-1].file_id
-        payload["caption"] = message.caption or ""
-        await message.answer_photo(payload["file_id"], caption=payload["caption"])
-
-    elif b_type == "video":
-        if not message.video:
-            await message.answer("❌ Video yuboring.")
-            return
-        payload["file_id"] = message.video.file_id
-        payload["caption"] = message.caption or ""
-        await message.answer_video(payload["file_id"], caption=payload["caption"])
-
-    elif b_type == "audio":
-        if not message.audio:
-            await message.answer("❌ Musiqa (audio) yuboring.")
-            return
-        payload["file_id"] = message.audio.file_id
-        payload["caption"] = message.caption or ""
-        await message.answer_audio(payload["file_id"], caption=payload["caption"])
-
-    elif b_type == "document":
-        if not message.document:
-            await message.answer("❌ Fayl yuboring.")
-            return
-        payload["file_id"] = message.document.file_id
-        payload["caption"] = message.caption or ""
-        await message.answer_document(payload["file_id"], caption=payload["caption"])
-
-    elif b_type == "poll":
-        if not message.poll:
-            await message.answer("❌ So‘rovnoma yuboring.")
-            return
-        poll = message.poll
-        payload["question"] = poll.question
-        payload["options"] = [o.text for o in poll.options]
-        payload["is_anonymous"] = poll.is_anonymous
-        payload["allows_multiple_answers"] = poll.allows_multiple_answers
-        await message.bot.send_poll(
-            chat_id=message.from_user.id,
-            question=poll.question,
-            options=payload["options"],
-            is_anonymous=poll.is_anonymous,
-            allows_multiple_answers=poll.allows_multiple_answers,
-        )
-
-    else:
-        await message.answer("❌ Noma’lum tur.")
-        return
-
-    await state.update_data(broadcast_payload=payload)
-    await state.set_state(AdminBroadcastStates.confirm)
-
-    await message.answer(
-        "✅ Hammasi tayyor. Yuboramizmi?",
-        reply_markup=broadcast_confirm_keyboard()
-    )
-
-
-@router.callback_query(F.data == "broadcast_cancel")
-async def broadcast_cancel(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    role = await get_admin_role(callback.from_user.id)
-    await callback.message.answer(
-        "❌ Yuborish bekor qilindi",
-        reply_markup=admin_menu_keyboard(role)
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "broadcast_send")
-async def broadcast_send(callback: CallbackQuery, state: FSMContext):
-    role = await get_admin_role(callback.from_user.id)
-    if role != ADMIN_ROLE_SUPER:
-        await callback.answer("⛔ Sizda ruxsat yo‘q", show_alert=True)
-        return
-
-    data = await state.get_data()
-    payload = data.get("broadcast_payload")
-
-    if not payload:
-        await callback.answer("❌ Kontent topilmadi", show_alert=True)
-        return
-
+async def broadcast_to_all_users(bot, admin_message: Message, dry_run: bool = False) -> dict[str, float | int | str]:
     users = await db.fetch("SELECT user_id FROM users")
+    total = len(users)
     sent = 0
     failed = 0
+    content_type = detect_broadcast_type(admin_message)
+    started = perf_counter()
 
-    for row in users:
-        uid = row["user_id"]
+    for idx, row in enumerate(users, start=1):
+        user_id = row["user_id"]
         try:
-            if payload["type"] == "text":
-                await callback.bot.send_message(uid, payload["text"])
-            elif payload["type"] == "photo":
-                await callback.bot.send_photo(uid, payload["file_id"], caption=payload.get("caption", ""))
-            elif payload["type"] == "video":
-                await callback.bot.send_video(uid, payload["file_id"], caption=payload.get("caption", ""))
-            elif payload["type"] == "audio":
-                await callback.bot.send_audio(uid, payload["file_id"], caption=payload.get("caption", ""))
-            elif payload["type"] == "document":
-                await callback.bot.send_document(uid, payload["file_id"], caption=payload.get("caption", ""))
-            elif payload["type"] == "poll":
-                await callback.bot.send_poll(
-                    chat_id=uid,
-                    question=payload["question"],
-                    options=payload["options"],
-                    is_anonymous=payload.get("is_anonymous", True),
-                    allows_multiple_answers=payload.get("allows_multiple_answers", False),
-                )
+            if dry_run:
+                sent += 1
             else:
-                continue
-            sent += 1
-            await asyncio.sleep(0.03)
-        except Exception:
+                await bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=admin_message.chat.id,
+                    message_id=admin_message.message_id,
+                )
+                sent += 1
+        except Exception as e:
+            if not dry_run and admin_message.poll:
+                try:
+                    poll = admin_message.poll
+                    await bot.send_poll(
+                        chat_id=user_id,
+                        question=poll.question,
+                        options=[opt.text for opt in poll.options],
+                        is_anonymous=poll.is_anonymous,
+                        allows_multiple_answers=poll.allows_multiple_answers,
+                    )
+                    sent += 1
+                    continue
+                except Exception:
+                    pass
             failed += 1
+            if idx <= 5:
+                print(f"[BROADCAST][WARN] user_id={user_id} err={type(e).__name__}")
+
+        if idx % 30 == 0:
+            await asyncio.sleep(0.08)
+
+    duration = perf_counter() - started
+    return {
+        "total": total,
+        "sent": sent,
+        "failed": failed,
+        "duration_sec": round(duration, 2),
+        "content_type": content_type,
+    }
+
+
+@router.message(AdminBroadcastStates.waiting_message)
+async def admin_broadcast_waiting_message(message: Message, state: FSMContext):
+    role = await require_role(message, (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN))
+    if not role:
+        return
+
+    if (message.text or "").strip() == "⬅️ Orqaga":
+        await state.set_state(AdminMenuStates.menu)
+        await message.answer("🛠 ADMIN PANEL", reply_markup=admin_menu_keyboard(role))
+        return
+
+    dry_run = BROADCAST_DRY_RUN
+    stats = await broadcast_to_all_users(message.bot, message, dry_run=dry_run)
 
     await log_admin_action(
-        admin_id=callback.from_user.id,
+        admin_id=message.from_user.id,
         action="BROADCAST_SENT",
-        details=f"type={payload['type']} sent={sent} failed={failed}"
+        details=(
+            f"type={stats['content_type']} total={stats['total']} sent={stats['sent']} "
+            f"failed={stats['failed']} duration_sec={stats['duration_sec']} dry_run={dry_run}"
+        ),
     )
 
-    await state.clear()
-    await callback.message.answer(
-        f"✅ Reklama yuborildi.\n\n"
-        f"📨 Yuborildi: {sent}\n"
-        f"⚠️ Xatolik: {failed}",
-        reply_markup=admin_menu_keyboard(role)
+    print(
+        f"[BROADCAST] admin_id={message.from_user.id} type={stats['content_type']} "
+        f"total={stats['total']} sent={stats['sent']} failed={stats['failed']} "
+        f"duration_sec={stats['duration_sec']} dry_run={dry_run}"
     )
-    await callback.answer()
+
+    await state.set_state(AdminMenuStates.menu)
+    await message.answer(
+        f"✅ Reklama yuborildi.\n\n"
+        f"👥 Jami: {stats['total']}\n"
+        f"📨 Yuborildi: {stats['sent']}\n"
+        f"⚠️ Xatolik: {stats['failed']}\n"
+        f"⏱ Vaqt: {stats['duration_sec']} s",
+        reply_markup=admin_menu_keyboard(role),
+    )
 
 
 @router.message(AdminMenuStates.menu, F.text == "👮‍♂️ Adminlar")
@@ -3786,6 +3905,91 @@ async def balance_handler(callback: CallbackQuery):
     await callback.answer()
 
 
+def withdraw_cancel_inline_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="withdraw_cancel")]
+        ]
+    )
+
+
+@router.callback_query(F.data == "withdraw_start")
+async def withdraw_start_handler(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    print(f"[WITHDRAW_CLICK] user_id={user_id} action=withdraw_start")
+    user = await get_user(user_id)
+    if not user:
+        await callback.answer("Foydalanuvchi topilmadi.", show_alert=True)
+        return
+
+    balance = int(user["almaz_balance"] or 0)
+    await state.set_state(WithdrawStates.waiting_amount)
+    await callback.message.answer(
+        (
+            "Qancha almaz yechmoqchisiz?\n"
+            f"Joriy balans: {balance} almaz\n\n"
+            "Bekor qilish: ⬅️ Orqaga"
+        ),
+        reply_markup=withdraw_cancel_inline_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "withdraw_cancel")
+async def withdraw_cancel_handler(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    text = await build_balance_text(callback.from_user.id, callback.from_user.first_name)
+    if not text:
+        await callback.answer("Foydalanuvchi topilmadi", show_alert=True)
+        return
+    await safe_edit(callback, text, reply_markup=promo_enter_keyboard())
+    await callback.answer()
+
+
+@router.message(WithdrawStates.waiting_amount)
+async def withdraw_receive_amount(message: Message, state: FSMContext):
+    if (message.text or "").strip() in {"⬅️ Orqaga", "Orqaga"}:
+        await state.clear()
+        text = await build_balance_text(message.from_user.id, message.from_user.first_name)
+        if text:
+            await message.answer(text, reply_markup=promo_enter_keyboard())
+        else:
+            await message.answer("Foydalanuvchi topilmadi")
+        return
+
+    raw_amount = (message.text or "").strip().replace(" ", "").replace(",", "")
+    if not raw_amount.isdigit():
+        await message.answer("❌ Faqat raqam kiriting.", reply_markup=withdraw_cancel_inline_keyboard())
+        return
+
+    amount = int(raw_amount)
+    if amount <= 0:
+        await message.answer("❌ Miqdor 0 dan katta bo'lishi kerak.", reply_markup=withdraw_cancel_inline_keyboard())
+        return
+
+    user = await get_user(message.from_user.id)
+    if not user:
+        await state.clear()
+        await message.answer("Foydalanuvchi topilmadi")
+        return
+
+    balance = int(user["almaz_balance"] or 0)
+    if balance < amount:
+        await message.answer(
+            f"❌ Balansingiz yetarli emas. Joriy balans: {balance} almaz.",
+            reply_markup=withdraw_cancel_inline_keyboard(),
+        )
+        return
+
+    await state.set_state(WithdrawStates.waiting_ff_id)
+    await state.update_data(withdraw_amount=amount)
+    await message.answer(
+        "🎮 Endi Free Fire ID raqamingizni yuboring.\nBekor qilish: ⬅️ Orqaga",
+        reply_markup=withdraw_cancel_inline_keyboard(),
+        parse_mode="HTML",
+    )
+
+
 @router.callback_query(F.data.startswith("wd_amount:"))
 async def withdraw_choose_amount(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
@@ -3823,6 +4027,15 @@ async def withdraw_receive_ff_id(message: Message, state: FSMContext):
     amount = data.get("withdraw_amount")
     ff_id = (message.text or "").strip()
 
+    if ff_id in {"⬅️ Orqaga", "Orqaga"}:
+        await state.clear()
+        text = await build_balance_text(message.from_user.id, message.from_user.first_name)
+        if text:
+            await message.answer(text, reply_markup=promo_enter_keyboard())
+        else:
+            await message.answer("Foydalanuvchi topilmadi")
+        return
+
     if not amount or not ff_id:
         await message.answer("❌ Noto'g'ri ma'lumot. /start yuborib qayta urinib ko'ring.")
         await state.clear()
@@ -3839,7 +4052,7 @@ async def withdraw_receive_ff_id(message: Message, state: FSMContext):
         "✅ Almaz yechish bo'yicha so'rovingiz qabul qilindi!\n\n"
         f"📥 Miqdor: <b>{amount} Almaz</b>\n"
         f"🎮 Free Fire ID: <code>{ff_id}</code>\n\n"
-        "Almaz 24 soat ichida Free Fire akkauntingizga tushiriladi. Iltimos, sabr qiling 🙂",
+        "Almaz 24 soat ichida Free Fire akkauntingizga tushiriladi. Iltimos, sabr qiling ??",
         parse_mode="HTML"
     )
 
@@ -3949,12 +4162,16 @@ async def withdraw_reject(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("wd_edit:"))
+@router.callback_query(F.data.startswith("withdraw:edit:"))
 async def withdraw_edit_start(callback: CallbackQuery, state: FSMContext):
     if not await is_owner_or_admin(callback.from_user.id):
         await callback.answer("Sizda bu amal uchun ruxsat yo'q.", show_alert=True)
         return
     try:
-        req_id = int(callback.data.split(":")[1])
+        if callback.data.startswith("withdraw:edit:"):
+            req_id = int(callback.data.split(":")[2])
+        else:
+            req_id = int(callback.data.split(":")[1])
     except ValueError:
         await callback.answer("Noto'g'ri so'rov.", show_alert=True)
         return
@@ -3967,28 +4184,48 @@ async def withdraw_edit_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer(f"Bu so'rov allaqachon '{req['status']}' holatida.", show_alert=True)
         return
 
-    await state.set_state(WithdrawEdit.waiting_text)
-    await state.update_data(edit_request_id=req_id)
+    await state.set_state(AdminWithdrawEditStates.waiting_text)
+    await state.update_data(
+        edit_request_id=req_id,
+        edit_target_user_id=req["user_id"],
+        edit_admin_panel_chat_id=callback.message.chat.id if callback.message else None,
+        edit_admin_panel_message_id=callback.message.message_id if callback.message else None,
+    )
 
     await callback.message.answer(
-        "✏️ Foydalanuvchiga yuboriladigan xabar matnini kiriting.\n"
-        "Masalan: Free Fire ID noto'g'ri ko'rsatilgan, iltimos, qayta yuboring."
+        "Yangi xabar matnini kiriting. Bekor qilish: ⬅️ Orqaga",
+        reply_markup=back_only_keyboard(),
     )
     await callback.answer()
 
 
-@router.message(WithdrawEdit.waiting_text)
+@router.message(AdminWithdrawEditStates.waiting_text)
 async def withdraw_edit_send(message: Message, state: FSMContext):
     if not await is_owner_or_admin(message.from_user.id):
         return
+
+    if (message.text or "").strip() == "⬅️ Orqaga":
+        await state.clear()
+        role = await get_admin_role(message.from_user.id)
+        await message.answer("Bekor qilindi.", reply_markup=admin_menu_keyboard(role) if role else None)
+        return
+
     data = await state.get_data()
     req_id = data.get("edit_request_id")
+    target_user_id = data.get("edit_target_user_id")
     if not req_id:
         await state.clear()
         await message.answer("❌ So'rov topilmadi. Qaytadan urinib ko'ring.")
         return
 
     note = (message.text or "").strip()
+    if not note:
+        await message.answer("❌ Matn bo'sh bo'lmasligi kerak.")
+        return
+    if len(note) > 4096:
+        await message.answer("❌ Matn juda uzun. 4096 belgidan oshmasin.")
+        return
+
     req = await get_withdraw_request(int(req_id))
     if not req:
         await state.clear()
@@ -3997,33 +4234,48 @@ async def withdraw_edit_send(message: Message, state: FSMContext):
 
     if req["status"] != "pending":
         await state.clear()
-        await message.answer(f"ℹ️ Bu so'rov allaqachon '{req['status']}' holatiga o'tkazilgan.")
+        await message.answer(f"❌ Bu so'rov allaqachon '{req['status']}' holatiga o'tkazilgan.")
         return
 
+    delivery_error = None
     try:
         await message.bot.send_message(
-            req["user_id"],
-            f"✏️ Almaz yechish so'rovi bo'yicha xabar:\n\n{note}"
+            int(target_user_id or req["user_id"]),
+            f"✏️ Almaz yechish so'rovi bo'yicha xabar:\n\n{note}",
         )
-    except Exception:
-        pass
+    except Exception as e:
+        delivery_error = f"{type(e).__name__}: {e}"
 
-    await update_withdraw_status(int(req_id), "edited", message.from_user.id, note)
-    await update_withdraw_admin_messages(message.bot, int(req_id), "✏️ Tahrirlandi")
+    updated = await mark_withdraw_as_edited(int(req_id), message.from_user.id, note)
+    if not updated:
+        await state.clear()
+        await message.answer("❌ So'rov holatini yangilab bo'lmadi (ehtimol allaqachon qayta ishlangan).")
+        return
+
+    await update_withdraw_admin_messages(message.bot, int(req_id), "✅ Status: edited")
     await log_admin_action(
         admin_id=message.from_user.id,
         action="WITHDRAW_EDITED",
         order_id=None,
-        details=f"withdraw_request:{req_id}",
+        details=f"withdraw_request:{req_id};admin_id:{message.from_user.id};user_id:{target_user_id or req['user_id']}",
     )
 
     await state.clear()
     role = await get_admin_role(message.from_user.id)
-    await message.answer(
-        "✅ Izoh foydalanuvchiga yuborildi va so'rov <b>tahrirlandi</b> holatiga o'tkazildi.",
-        parse_mode="HTML",
-        reply_markup=admin_menu_keyboard(role) if role else None
+    result_text = (
+        f"✅ So'rov tahrirlandi.\n"
+        f"Request ID: {req_id}\n"
+        f"User ID: {target_user_id or req['user_id']}\n"
+        f"📝 Updated message:\n{note[:700]}"
     )
+    if delivery_error:
+        result_text += f"\n\n⚠️ Foydalanuvchiga yuborishda xatolik: {delivery_error}"
+
+    await message.answer(
+        result_text,
+        reply_markup=admin_menu_keyboard(role) if role else None,
+    )
+
 
 @router.callback_query(F.data == "contact_admin")
 async def contact_admin_handler(callback: CallbackQuery):
@@ -4499,7 +4751,7 @@ async def admin_edit_voucher_start(message: Message, state: FSMContext):
 
     vouchers = await db.fetch(
         """
-        SELECT id, name
+        SELECT id, name, price
         FROM vouchers
         WHERE active = TRUE
         ORDER BY
@@ -4518,7 +4770,7 @@ async def admin_edit_voucher_start(message: Message, state: FSMContext):
 
     text = "✏️ Tahrirlash uchun voucher RAQAMINI yuboring:\n\n"
     for v in vouchers:
-        text += f"{v['id']}. {v['name']}\n"
+        text += f"{v['id']}. {v['name']} — {v['price']:,} so‘m\n"
 
     await state.set_state(AdminVouchersStates.edit_select)
     await message.answer(text)
@@ -4581,26 +4833,91 @@ async def admin_edit_voucher_save(message: Message, state: FSMContext):
         return
 
     data = await state.get_data()
-
     field = data["field"]
     voucher_id = data["voucher_id"]
-    value = message.text
+    value_raw = (message.text or "").strip()
+    allowed_fields = {"name", "almaz", "price"}
 
-    if field in ["almaz", "price"] and not value.isdigit():
-        await message.answer("❌ Faqat raqam kiriting")
+    if field not in allowed_fields:
+        await state.set_state(AdminVouchersStates.menu)
+        await message.answer(
+            "❌ Noto‘g‘ri maydon tanlangan. Qaytadan urinib ko‘ring.",
+            reply_markup=admin_vouchers_menu_keyboard(),
+        )
         return
 
-    await db.execute(
-        f"UPDATE vouchers SET {field} = $1 WHERE id = $2",
-        value,
+    if not value_raw:
+        await message.answer("❌ Qiymat bo‘sh bo‘lishi mumkin emas")
+        return
+
+    current = await db.fetchrow(
+        "SELECT id, name, almaz, price FROM vouchers WHERE id = $1 AND active = TRUE",
         voucher_id,
+    )
+    if not current:
+        await state.set_state(AdminVouchersStates.menu)
+        await message.answer(
+            "❌ Voucher topilmadi yoki nofaol.",
+            reply_markup=admin_vouchers_menu_keyboard(),
+        )
+        return
+
+    old_value = current[field]
+    new_value = value_raw
+
+    if field in ["almaz", "price"]:
+        parsed, err = validate_voucher_numeric_value(field, value_raw)
+        if err:
+            await message.answer(err)
+            return
+        new_value = parsed
+
+    try:
+        await db.execute(
+            f"UPDATE vouchers SET {field} = $1 WHERE id = $2",
+            new_value,
+            voucher_id,
+        )
+    except Exception as e:
+        await log_admin_action(
+            admin_id=message.from_user.id,
+            action="VOUCHER_UPDATE_FAILED",
+            details=(
+                f"voucher_id:{voucher_id} field:{field} value:{new_value} "
+                f"error:{type(e).__name__}:{e}"
+            ),
+        )
+        await message.answer(
+            "❌ Voucher yangilanmadi. Qiymat formatini tekshiring va qaytadan urinib ko‘ring."
+        )
+        return
+
+    await log_admin_action(
+        admin_id=message.from_user.id,
+        action="VOUCHER_UPDATED",
+        details=(
+            f"voucher_id:{voucher_id} field:{field} "
+            f"old:{old_value} new:{new_value} at:{utc_now().isoformat()}"
+        ),
     )
 
     await state.set_state(AdminVouchersStates.menu)
 
+    if field in ("price", "almaz"):
+        old_fmt = format_money(int(old_value))
+        new_fmt = format_money(int(new_value))
+    else:
+        old_fmt = str(old_value)
+        new_fmt = str(new_value)
+
     await message.answer(
-        "✅ Voucher muvaffaqiyatli yangilandi",
-        reply_markup=admin_vouchers_menu_keyboard()
+        (
+            "✅ Voucher muvaffaqiyatli yangilandi\n"
+            f"Maydon: {field}\n"
+            f"Oldin: {old_fmt}\n"
+            f"Yangi: {new_fmt}"
+        ),
+        reply_markup=admin_vouchers_menu_keyboard(),
     )
 
 
@@ -4623,6 +4940,26 @@ async def admin_vouchers_back(message: Message, state: FSMContext):
         "🛠 ADMIN PANEL",
         reply_markup=admin_menu_keyboard(role)
     )
+
+
+@router.message(AdminVouchersStates.menu)
+async def admin_vouchers_menu_fallback(message: Message, state: FSMContext):
+    role = await get_admin_role(message.from_user.id)
+    if role not in (ADMIN_ROLE_SUPER,):
+        return
+
+    raw = message.text or ""
+    norm = normalize_menu_text(raw)
+    log_admin_text_debug_once(message.from_user.id, raw, context="admin_vouchers_menu")
+
+    if not norm:
+        return
+    if "orqaga" in norm:
+        await admin_vouchers_back(message, state)
+        return
+    if "voucher" in norm and ("tahrir" in norm or "edit" in norm):
+        await admin_edit_voucher_start(message, state)
+        return
 
 async def reminder_worker(bot):
     print("🔔 Reminder worker ishga tushdi")
@@ -4998,7 +5335,7 @@ BONUS_CODE_HELP_TEXT = (
     "━━━━━━━━━━━━━━\n"
     "👤 <b>1-QADAM. BONUS KOD YARATISH</b>\n"
     "━━━━━━━━━━━━━━\n"
-    "• «🎁 Kod yaratish» tugmasini bosing\n"
+    "• «🎁 Kod yaratishВ» tugmasini bosing\n"
     "• Sizga maxsus bonus kod beriladi\n"
     "• Har bir foydalanuvchida faqat 1 ta aktiv kod bo‘ladi\n"
     "• Kod 4 kun davomida amal qiladi\n\n"
@@ -5007,7 +5344,7 @@ BONUS_CODE_HELP_TEXT = (
     "🤝 <b>2-QADAM. KODNI DO‘STLARGA BERISH</b>\n"
     "━━━━━━━━━━━━━━\n"
     "• Yaratilgan kodni do‘stlaringizga yuboring\n"
-    "• Do‘stlaringiz «📥 Kod ishlatish» tugmasi orqali kodni kiritadi\n"
+    "• Do‘stlaringiz «📥 Kod ishlatishВ» tugmasi orqali kodni kiritadi\n"
     "• Shundan so‘ng ular odatdagidek paket yoki voucher sotib olishadi\n\n"
 
     "━━━━━━━━━━━━━━\n"
@@ -5082,3 +5419,4 @@ async def back_to_main_menu_handler(callback: CallbackQuery, state: FSMContext):
     )
 
     await callback.answer()
+
