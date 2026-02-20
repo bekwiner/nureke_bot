@@ -3913,6 +3913,18 @@ def withdraw_cancel_inline_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+WITHDRAW_FIXED_AMOUNT = 105
+
+
+def withdraw_amount_inline_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"{WITHDRAW_FIXED_AMOUNT} Almaz 💎", callback_data=f"wd_amount:{WITHDRAW_FIXED_AMOUNT}")],
+            [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="withdraw_cancel")],
+        ]
+    )
+
+
 @router.callback_query(F.data == "withdraw_start")
 async def withdraw_start_handler(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
@@ -3926,11 +3938,10 @@ async def withdraw_start_handler(callback: CallbackQuery, state: FSMContext):
     await state.set_state(WithdrawStates.waiting_amount)
     await callback.message.answer(
         (
-            "Qancha almaz yechmoqchisiz?\n"
-            f"Joriy balans: {balance} almaz\n\n"
-            "Bekor qilish: ⬅️ Orqaga"
+            f"Balansingiz: {balance} Almaz\n"
+            "Qancha almazni yechmoqchi ekanligingizni tanlang:"
         ),
-        reply_markup=withdraw_cancel_inline_keyboard(),
+        reply_markup=withdraw_amount_inline_keyboard(),
     )
     await callback.answer()
 
@@ -3959,12 +3970,18 @@ async def withdraw_receive_amount(message: Message, state: FSMContext):
 
     raw_amount = (message.text or "").strip().replace(" ", "").replace(",", "")
     if not raw_amount.isdigit():
-        await message.answer("❌ Faqat raqam kiriting.", reply_markup=withdraw_cancel_inline_keyboard())
+        await message.answer(
+            f"❌ Faqat {WITHDRAW_FIXED_AMOUNT} almaz yechish mumkin. Tugmani bosing.",
+            reply_markup=withdraw_amount_inline_keyboard(),
+        )
         return
 
     amount = int(raw_amount)
-    if amount <= 0:
-        await message.answer("❌ Miqdor 0 dan katta bo'lishi kerak.", reply_markup=withdraw_cancel_inline_keyboard())
+    if amount != WITHDRAW_FIXED_AMOUNT:
+        await message.answer(
+            f"❌ Faqat {WITHDRAW_FIXED_AMOUNT} almaz yechish mumkin. Tugmani bosing.",
+            reply_markup=withdraw_amount_inline_keyboard(),
+        )
         return
 
     user = await get_user(message.from_user.id)
@@ -3974,15 +3991,15 @@ async def withdraw_receive_amount(message: Message, state: FSMContext):
         return
 
     balance = int(user["almaz_balance"] or 0)
-    if balance < amount:
+    if balance < WITHDRAW_FIXED_AMOUNT:
         await message.answer(
-            f"❌ Balansingiz yetarli emas. Joriy balans: {balance} almaz.",
+            f"❌ Balans yetarli emas. Yechish uchun kamida {WITHDRAW_FIXED_AMOUNT} almaz kerak.",
             reply_markup=withdraw_cancel_inline_keyboard(),
         )
         return
 
     await state.set_state(WithdrawStates.waiting_ff_id)
-    await state.update_data(withdraw_amount=amount)
+    await state.update_data(withdraw_amount=WITHDRAW_FIXED_AMOUNT)
     await message.answer(
         "🎮 Endi Free Fire ID raqamingizni yuboring.\nBekor qilish: ⬅️ Orqaga",
         reply_markup=withdraw_cancel_inline_keyboard(),
@@ -4005,17 +4022,22 @@ async def withdraw_choose_amount(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Noto'g'ri miqdor.", show_alert=True)
         return
 
-    if balance < amount:
+    if amount != WITHDRAW_FIXED_AMOUNT:
+        await callback.answer(f"Faqat {WITHDRAW_FIXED_AMOUNT} almaz yechish mumkin.", show_alert=True)
+        return
+
+    if balance < WITHDRAW_FIXED_AMOUNT:
         await callback.answer("Balansingiz o'zgargan, yechish uchun yetarli emas.", show_alert=True)
         return
 
     await state.set_state(WithdrawStates.waiting_ff_id)
-    await state.update_data(withdraw_amount=amount)
+    await state.update_data(withdraw_amount=WITHDRAW_FIXED_AMOUNT)
 
     await callback.message.answer(
         "🎮 Endi, almaz yechmoqchi bo'lgan Free Fire akkauntingiz <b>ID raqamini</b> yuboring.\n\n"
         "ID ni diqqat bilan tekshirib yuboring — almaz aynan shu akkauntga tushiriladi.",
-        parse_mode="HTML"
+        parse_mode="HTML",
+        reply_markup=withdraw_cancel_inline_keyboard(),
     )
     await callback.answer()
 
@@ -4043,6 +4065,14 @@ async def withdraw_receive_ff_id(message: Message, state: FSMContext):
 
     if len(ff_id) < 3:
         await message.answer("⚠️ Free Fire ID juda qisqa ko'rinmoqda. Iltimos, qayta tekshirib yuboring.")
+        return
+
+    if int(amount) != WITHDRAW_FIXED_AMOUNT:
+        await state.clear()
+        await message.answer(
+            f"❌ Faqat {WITHDRAW_FIXED_AMOUNT} almaz yechish mumkin. Qaytadan urinib ko'ring.",
+            reply_markup=promo_enter_keyboard(),
+        )
         return
 
     request_id = await create_withdraw_request(user_id, int(amount), ff_id)
