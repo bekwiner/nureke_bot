@@ -2155,11 +2155,12 @@ async def ff_id_handler(message: Message, state: FSMContext):
             now,
         )
 
+        sender_username = message.from_user.username or "yo'q"
         admin_text = (
             '🧾 YANGI BUYURTMA\n\n'
             f"🧾 Buyurtma raqami: #{order_id}\n"
             f"👤 Foydalanuvchi: {message.from_user.full_name}\n"
-            f'🔗 Username: @{message.from_user.username if message.from_user.username else "yo'q"}\n'
+            f"🔗 Username: @{sender_username}\n"
             f"🆔 User ID: {message.from_user.id}\n\n"
             f"📦 Paket: {data.get('package_name') or data.get('name')}\n"
             f"💎 Almaz: {almaz_value}\n"
@@ -2291,11 +2292,12 @@ async def payment_handler(message: Message, state: FSMContext):
     if bonus_code_id:
         bonus_line = f"🎁 Bonus kod: <code>{data.get('bonus_code', '')}</code>\n"
 
+    sender_username = user.username or "yo'q"
     admin_text = (
         '🧾 YANGI BUYURTMA\n\n'
         f"🧾 Buyurtma raqami: #{order_id}\n"
         f"👤 Foydalanuvchi: {user.full_name}\n"
-        f'🔗 Username: @{user.username if user.username else "yo'q"}\n'
+        f"🔗 Username: @{sender_username}\n"
         f"🆔 User ID: {user.id}\n\n"
         f"{product_text}"
         f"🎮 FF ID: {data.get('ff_id')}\n\n"
@@ -2803,11 +2805,12 @@ async def topup_confirm_amount_handler(message: Message, state: FSMContext):
 
     if admin_chat_id and admin_message_id:
         try:
+            request_username = req["username"] or "yo'q"
             caption = (
                 "💰 SO'M BALANS TO'LDIRISH SO'ROVI\n\n"
                 f"🧾 So'rov raqami: #{request_id}\n"
                 f"👤 Foydalanuvchi: {req['first_name'] or '-'}\n"
-                f'🔗 Username: @{req["username"] if req["username"] else "yo'q"}\n'
+                f"🔗 Username: @{request_username}\n"
                 f"🆔 User ID: {user_id}\n\n"
                 f"📌 Holat: ✅ TASDIQLANDI\n"
                 f"💰 To'ldirildi: {amount:,} so'm\n"
@@ -5181,11 +5184,12 @@ async def balance_topup_check_handler(message: Message, state: FSMContext):
     request_id = await create_balance_topup_request(user, photo_id)
     await state.clear()
 
+    sender_username = user.username or "yo'q"
     admin_text = (
         "💰 SO'M BALANS TO'LDIRISH SO'ROVI\n\n"
         f"🧾 So'rov raqami: #{request_id}\n"
         f"👤 Foydalanuvchi: {user.full_name}\n"
-        f'🔗 Username: @{user.username if user.username else "yo'q"}\n'
+        f"🔗 Username: @{sender_username}\n"
         f"🆔 User ID: {user.id}\n\n"
         '📌 Holat: ⏳ Kutilmoqda\n'
         '💬 Admin summani tekshirib tasdiqlaydi.'
@@ -6045,10 +6049,11 @@ async def admin_user_search_handler(message: Message, state: FSMContext):
 
     joined_dt = format_dt_utc5(joined_at).split(" | ")[0]
 
+    profile_username = username or "yo'q"
     text = (
         f"👤 <b>FOYDALANUVCHI PROFILI</b>\n\n"
         f"👤 Ism: {first_name}\n"
-        f'🔗 Username: @{username if username else "yo'q"}\n'
+        f"🔗 Username: @{profile_username}\n"
         f"🆔 Telegram ID: {user_id}\n"
         f"📅 Botga kirgan: {joined_dt}\n\n"
         f"📊 <b>STATISTIKA</b>\n"
