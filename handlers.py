@@ -1935,7 +1935,7 @@ async def user_main_menu_reply_router(message: Message, state: FSMContext):
             return
         await message.answer(text, reply_markup=promo_enter_keyboard())
         return
-    if "admin bilan bog" in norm:
+    if "yordam" in norm or "admin bilan bog" in norm or ("admin" in norm and "yordam" in norm):
         await state.clear()
         row = await db.fetchrow(
             "SELECT value FROM settings WHERE key = $1",

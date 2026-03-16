@@ -32,6 +32,10 @@ class ContentButtonWiringTests(unittest.TestCase):
         self.assertIn("Mening balansim", handlers_source)
         self.assertIn("Yordam / Admin", handlers_source)
 
+    def test_help_button_branch_checks_yordam_text(self):
+        handlers_source = Path("handlers.py").read_text(encoding="utf-8")
+        self.assertIn('"yordam" in norm', handlers_source)
+
 
 if __name__ == "__main__":
     unittest.main()
