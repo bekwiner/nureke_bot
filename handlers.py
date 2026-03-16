@@ -2159,7 +2159,7 @@ async def ff_id_handler(message: Message, state: FSMContext):
             '🧾 YANGI BUYURTMA\n\n'
             f"🧾 Buyurtma raqami: #{order_id}\n"
             f"👤 Foydalanuvchi: {message.from_user.full_name}\n"
-            f'🔗 Username: @{message.from_user.username if message.from_user.username else "yo\'q"}\n'
+            f'🔗 Username: @{message.from_user.username if message.from_user.username else "yo'q"}\n'
             f"🆔 User ID: {message.from_user.id}\n\n"
             f"📦 Paket: {data.get('package_name') or data.get('name')}\n"
             f"💎 Almaz: {almaz_value}\n"
@@ -2295,7 +2295,7 @@ async def payment_handler(message: Message, state: FSMContext):
         '🧾 YANGI BUYURTMA\n\n'
         f"🧾 Buyurtma raqami: #{order_id}\n"
         f"👤 Foydalanuvchi: {user.full_name}\n"
-        f'🔗 Username: @{user.username if user.username else "yo\'q"}\n'
+        f'🔗 Username: @{user.username if user.username else "yo'q"}\n'
         f"🆔 User ID: {user.id}\n\n"
         f"{product_text}"
         f"🎮 FF ID: {data.get('ff_id')}\n\n"
@@ -2807,7 +2807,7 @@ async def topup_confirm_amount_handler(message: Message, state: FSMContext):
                 "💰 SO'M BALANS TO'LDIRISH SO'ROVI\n\n"
                 f"🧾 So'rov raqami: #{request_id}\n"
                 f"👤 Foydalanuvchi: {req['first_name'] or '-'}\n"
-                f'🔗 Username: @{req["username"] if req["username"] else "yo\'q"}\n'
+                f'🔗 Username: @{req["username"] if req["username"] else "yo'q"}\n'
                 f"🆔 User ID: {user_id}\n\n"
                 f"📌 Holat: ✅ TASDIQLANDI\n"
                 f"💰 To'ldirildi: {amount:,} so'm\n"
@@ -5185,7 +5185,7 @@ async def balance_topup_check_handler(message: Message, state: FSMContext):
         "💰 SO'M BALANS TO'LDIRISH SO'ROVI\n\n"
         f"🧾 So'rov raqami: #{request_id}\n"
         f"👤 Foydalanuvchi: {user.full_name}\n"
-        f'🔗 Username: @{user.username if user.username else "yo\'q"}\n'
+        f'🔗 Username: @{user.username if user.username else "yo'q"}\n'
         f"🆔 User ID: {user.id}\n\n"
         '📌 Holat: ⏳ Kutilmoqda\n'
         '💬 Admin summani tekshirib tasdiqlaydi.'
@@ -6048,7 +6048,7 @@ async def admin_user_search_handler(message: Message, state: FSMContext):
     text = (
         f"👤 <b>FOYDALANUVCHI PROFILI</b>\n\n"
         f"👤 Ism: {first_name}\n"
-        f'🔗 Username: @{username if username else "yo\'q"}\n'
+        f'🔗 Username: @{username if username else "yo'q"}\n'
         f"🆔 Telegram ID: {user_id}\n"
         f"📅 Botga kirgan: {joined_dt}\n\n"
         f"📊 <b>STATISTIKA</b>\n"
