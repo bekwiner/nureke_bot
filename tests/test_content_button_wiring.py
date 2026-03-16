@@ -44,8 +44,17 @@ class ContentButtonWiringTests(unittest.TestCase):
 
     def test_command_handlers_include_help_and_balance(self):
         handlers_source = Path("handlers.py").read_text(encoding="utf-8")
-        self.assertIn('Command(commands=["help", "Help"])', handlers_source)
-        self.assertIn('Command(commands=["balance", "Balance"])', handlers_source)
+        self.assertIn('StateFilter("*"), Command(commands=["help", "Help"])', handlers_source)
+        self.assertIn('StateFilter("*"), Command(commands=["balance", "Balance"])', handlers_source)
+
+    def test_generic_text_routes_do_not_swallow_commands(self):
+        handlers_source = Path("handlers.py").read_text(encoding="utf-8")
+        self.assertIn('~F.text.startswith("/")', handlers_source)
+
+    def test_admin_package_and_promocode_menus_have_fallback_routers(self):
+        handlers_source = Path("handlers.py").read_text(encoding="utf-8")
+        self.assertIn("async def admin_packages_menu_fallback", handlers_source)
+        self.assertIn("async def admin_promocode_menu_fallback", handlers_source)
 
 
 if __name__ == "__main__":

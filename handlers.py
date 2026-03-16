@@ -1876,6 +1876,7 @@ async def open_buy_voucher_from_message(message: Message, state: FSMContext):
 
 
 @router.message(
+    ~F.text.startswith("/"),
     F.text.in_(
         {
             "💎 Almaz olish",
@@ -1956,7 +1957,7 @@ async def user_main_menu_reply_router(message: Message, state: FSMContext):
 
 
 
-@router.message(StateFilter(None), F.text)
+@router.message(StateFilter(None), F.text, ~F.text.startswith("/"))
 async def user_dynamic_content_button_router(message: Message, state: FSMContext):
     current_state = await state.get_state()
     if current_state:
@@ -3180,7 +3181,7 @@ async def admin_edit_value_handler(message: Message, state: FSMContext):
 async def admin_panel_handler(message: Message, state: FSMContext):
     await _open_admin_panel(message, state)
 
-@router.message(Command(commands=["help", "Help"]))
+@router.message(StateFilter("*"), Command(commands=["help", "Help"]))
 async def help_handler(message: Message):
     text = (
         '🆘 <b>Yordam markazi</b>\n\n'
@@ -3212,8 +3213,12 @@ async def help_handler(message: Message):
     )
 
 
-@router.message(Command(commands=["balance", "Balance"]))
-async def balance_handler(message: Message):
+@router.message(StateFilter("*"), Command(commands=["balance", "Balance"]))
+async def balance_command_any_state(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state == BalanceTopupStates.waiting_check.state:
+        await state.clear()
+
     text = await build_balance_text(message.from_user.id, message.from_user.first_name)
     if not text:
         await message.answer("Foydalanuvchi topilmadi")
@@ -5108,6 +5113,31 @@ async def admin_delete_package_confirm(message: Message, state: FSMContext):
         reply_markup=admin_packages_menu_keyboard()
     )
 
+@router.message(AdminPackagesStates.menu)
+async def admin_packages_menu_fallback(message: Message, state: FSMContext):
+    role = await get_admin_role(message.from_user.id)
+    if role not in (ADMIN_ROLE_SUPER,):
+        return
+
+    raw = message.text or ""
+    norm = normalize_menu_text(raw)
+    log_admin_text_debug_once(message.from_user.id, raw, context="admin_packages_menu")
+
+    if not norm:
+        return
+    if "orqaga" in norm:
+        await admin_packages_back(message, state)
+        return
+    if "qo'sh" in norm or "qosh" in norm:
+        await admin_add_package_start(message, state)
+        return
+    if "tahrir" in norm or "edit" in norm or "narx" in norm:
+        await admin_edit_package_start(message, state)
+        return
+    if "o'chir" in norm or "ochir" in norm or "delete" in norm:
+        await admin_delete_package_start(message, state)
+        return
+
 @router.message(AdminPackagesStates.menu, F.text == '⬅️ Orqaga')
 async def admin_packages_back(message: Message, state: FSMContext):
     # paketlar state'dan chiqamiz
@@ -6596,6 +6626,28 @@ async def admin_promo_list(message: Message):
         text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
     )
+
+@router.message(AdminPromoStates.menu)
+async def admin_promocode_menu_fallback(message: Message, state: FSMContext):
+    role = await get_admin_role(message.from_user.id)
+    if role not in (ADMIN_ROLE_SUPER,):
+        return
+
+    raw = message.text or ""
+    norm = normalize_menu_text(raw)
+    log_admin_text_debug_once(message.from_user.id, raw, context="admin_promocode_menu")
+
+    if not norm:
+        return
+    if "orqaga" in norm:
+        await admin_promo_back(message, state)
+        return
+    if "yarat" in norm or "qo'sh" in norm or "qosh" in norm:
+        await admin_add_promo_start(message, state)
+        return
+    if "ro'yxat" in norm or "royxat" in norm or "list" in norm:
+        await admin_promo_list(message)
+        return
 
 
 @router.message(AdminPromoStates.menu, F.text == '⬅️ Orqaga')
