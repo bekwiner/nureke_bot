@@ -13,7 +13,11 @@ venv/
 
 # Env/Secrets
 .env
+.env.*
+!.env.example
 *.pem
+bot.db
+.bot.lock
 
 # IDE
 .vscode/
@@ -22,3 +26,6 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Tooling caches
+.pytest_cache/

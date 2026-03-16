@@ -8,6 +8,10 @@ class OrderStates(StatesGroup):
     waiting_payment = State()
 
 
+class BalanceTopupStates(StatesGroup):
+    waiting_check = State()
+
+
 class AdminStates(StatesGroup):
     waiting_custom_message = State()
 
@@ -15,6 +19,15 @@ class AdminStates(StatesGroup):
 class AdminOrderEditStates(StatesGroup):
     select_field = State()
     edit_value = State()
+
+
+class AdminBalanceTopupStates(StatesGroup):
+    waiting_amount = State()
+
+
+class AdminManualMoneyBalanceStates(StatesGroup):
+    waiting_user_id = State()
+    waiting_amount = State()
 
 
 class WithdrawStates(StatesGroup):
@@ -138,3 +151,20 @@ class AdminStatsStates(StatesGroup):
 
 class MainMenuTextEditState(StatesGroup):
     waiting_text = State()
+
+
+class AdminContentButtonStates(StatesGroup):
+    menu = State()
+    add_label = State()
+    add_content = State()
+    edit_select = State()
+    edit_content = State()
+    delete_select = State()
+
+
+from aiogram.fsm.state import StatesGroup, State
+
+
+class ChanManage(StatesGroup):
+    ADD = State()
+    REMOVE = State()

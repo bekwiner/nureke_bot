@@ -3,16 +3,29 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-def main_menu_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="💎 Almaz sotib olish", callback_data="buy_almaz")],
-            [InlineKeyboardButton(text="💳 Voucher sotib olish", callback_data="buy_voucher")],
-            [InlineKeyboardButton(text="🎁 Bonusli kod orqali donat", callback_data="bonus_code_menu")],
-            [InlineKeyboardButton(text="📊 Narxlar", callback_data="prices")],
-            [InlineKeyboardButton(text="💰 Balans", callback_data="balance")],
-            [InlineKeyboardButton(text="📞 Admin bilan bog‘lanish", callback_data="contact_admin")],
-        ]
+def main_menu_keyboard(extra_buttons: list[str] | None = None):
+    keyboard = [
+        [
+            KeyboardButton(text="💎 Almaz olish"),
+            KeyboardButton(text="🎫 Voucher olish")
+        ],
+        [
+            KeyboardButton(text="📊 Paket narxlari"),
+            KeyboardButton(text="💰 Mening balansim")
+        ],
+        [
+            KeyboardButton(text="📞 Yordam / Admin")
+        ],
+    ]
+
+    for label in extra_buttons or []:
+        cleaned = (label or "").strip()
+        if cleaned:
+            keyboard.append([KeyboardButton(text=cleaned)])
+
+    return ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True,
     )
 
 
@@ -28,7 +41,36 @@ def confirm_package_keyboard():
                     text="💳 To‘lov qilish",
                     callback_data="go_to_payment"
                 ),
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💰 Sum balansdan yechib olish",
+                    callback_data="pay_with_money_balance"
+                )
+            ],
+        ]
+    )
+
+
+def admin_balance_topup_keyboard(request_id: int, user_id: int):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Tasdiqlash",
+                    callback_data=f"topup_confirm:{request_id}:{user_id}"
+                ),
+                InlineKeyboardButton(
+                    text="❌ Bekor qilish",
+                    callback_data=f"topup_cancel:{request_id}:{user_id}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💣 Soxta chek",
+                    callback_data=f"topup_fake:{request_id}:{user_id}"
+                )
+            ],
         ]
     )
 
@@ -44,6 +86,12 @@ def admin_order_keyboard(user_id: int, almaz: int, order_id: int):
                     text="💣 Soxta chek",
                     callback_data=f"admin_fake:{order_id}:{user_id}"
                 ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Bekor qilish",
+                    callback_data=f"admin_cancel:{order_id}:{user_id}"
+                )
             ],
             [
                 InlineKeyboardButton(
@@ -118,6 +166,7 @@ def admin_menu_keyboard(role: str):
             [KeyboardButton(text="🧾 Buyurtmalar")],
             [KeyboardButton(text="Admins statics")],
             [KeyboardButton(text="Asosiy menyu textini o'zgartirish")],
+            [KeyboardButton(text="📥 Bo'limga yuklash")],
             [KeyboardButton(text="🪵 Admin loglari")],
             [KeyboardButton(text="🔍 Foydalanuvchini topish")],
             [KeyboardButton(text="⬅️ Orqaga")],
@@ -131,7 +180,9 @@ def admin_menu_keyboard(role: str):
             [KeyboardButton(text="📊 Daromad statistikasi")],
             [KeyboardButton(text="Admins statics")],
             [KeyboardButton(text="Asosiy menyu textini o'zgartirish")],
+            [KeyboardButton(text="📥 Bo'limga yuklash")],
             [KeyboardButton(text="🪵 Admin loglari")],
+            [KeyboardButton(text="🧩 Majburiy kanallar")],
             [KeyboardButton(text="🎁 Promokodlar")],
             [KeyboardButton(text="🔍 Foydalanuvchini topish")],
             [KeyboardButton(text="💰 Narxlar matnini tahrirlash")],
@@ -275,12 +326,32 @@ def promo_enter_keyboard():
             ],
             [
                 InlineKeyboardButton(
+                    text="💳 TO‘LOV BOSQICHI",
+                    callback_data="balance_payment_stage"
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="⬅️ Orqaga",
                     callback_data="back_to_menu"
                 )
             ]
         ]
     )
+
+
+def balance_payment_stage_back_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Orqaga",
+                    callback_data="balance"
+                )
+            ]
+        ]
+    )
+
 
 def admin_promocode_menu_keyboard():
     return ReplyKeyboardMarkup(
@@ -469,4 +540,17 @@ def main_menu_text_back_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="Orqaga")]],
         resize_keyboard=True
+    )
+
+
+def admin_content_buttons_menu_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="➕ Yangi qo'shish")],
+            [KeyboardButton(text="📋 Ro'yxat")],
+            [KeyboardButton(text="✏️ Tahrirlash")],
+            [KeyboardButton(text="❌ O'chirish")],
+            [KeyboardButton(text="⬅️ Orqaga")],
+        ],
+        resize_keyboard=True,
     )

@@ -46,6 +46,7 @@ from keyboards import admin_vouchers_menu_keyboard
 
 from states import PromoCodeStates
 from keyboards import promo_enter_keyboard
+from keyboards import balance_payment_stage_back_keyboard
 
 from states import AdminPromoStates
 from keyboards import admin_promocode_menu_keyboard
@@ -57,17 +58,43 @@ from keyboards import main_menu_text_back_keyboard
 
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+from typing import Optional
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import StateFilter
+
+from aiogram import Bot
+from config import BOT_TOKEN
+bot = Bot(token=BOT_TOKEN)
+
+from states import ChanManage
+
+from config import SUPERADMIN_IDS
+
+OWNER_ID = SUPERADMIN_IDS[0]
+
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+
+from database import (
+    list_required_channels,
+    add_required_channel,
+    remove_required_channel,
+    required_channels_count,
+)
+
 from keyboards import (
     main_menu_keyboard,
     confirm_package_keyboard,
+    admin_balance_topup_keyboard,
     admin_order_keyboard,
     admin_order_edit_keyboard,
     admin_order_edit_cancel_keyboard,
 )
 from states import (
     OrderStates,
+    BalanceTopupStates,
     AdminStates,
     AdminOrderEditStates,
+    AdminBalanceTopupStates,
     WithdrawStates,
     AdminWithdrawEditStates,
     AdminBroadcastStates,
@@ -78,6 +105,7 @@ from states import (
     BonusCodeStates,
     AdminStatsStates,
     MainMenuTextEditState,
+    AdminContentButtonStates,
 )
 from keyboards import (
     bonus_code_menu_keyboard,
@@ -85,27 +113,311 @@ from keyboards import (
     admin_roles_menu_keyboard,
     admin_payment_cards_menu_keyboard,
     admin_logchat_menu_keyboard,
+    admin_content_buttons_menu_keyboard,
     admin_stats_admins_keyboard,
     admin_stats_detail_keyboard,
 )
 
+back_kb = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text='⬅️ Orqaga')]],
+    resize_keyboard=True
+)
+
+admin_menu = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text='⬅️ Orqaga')]],
+    resize_keyboard=True
+)
+
 router = Router()
 
+# 1️⃣ REQUIRED CHANNELS DEFAULT VA GLOBAL O'ZGARUVCHILAR
+PROOF_CHANNEL_SETTING_KEY = "proof_channel_id"
+PROOF_CHANNEL_BUTTON = "proof_channel_link"
+CONTENT_BUTTON_SUPPORTED_TYPES = {
+    "text",
+    "document",
+    "photo",
+    "video",
+    "voice",
+    "audio",
+    "animation",
+    "video_note",
+    "sticker",
+}
+
+
+# 2️⃣ ASOSIY HELPER FUNKSIYALAR
+
+async def _get_required_channels():
+    return await list_required_channels()
+
+
+async def check_subscription(user_id: int) -> list[str]:
+    "\n    Foydalanuvchining har bir majburiy kanalga obuna holatini tekshiradi.\n    \n    Qaytaradi: \n    - list[str]: Obuna bo'lmagan kanallar ro'yxati\n    - [] (bo'sh list): Agar hamma kanalga obuna bo'lgan\n    \n    Bot kanalga qo'shilmagan yoki admin emas bo'lsa → not_sub ga qo'shiladi.\n    "
+    not_sub = []
+    channels = await _get_required_channels()
+
+    if not channels:
+        return []
+
+    for ch in channels:
+        chat_ref: Optional[str | int] = ch.strip()
+        try:
+            # @username formatini o'zgartirishsiz qoldiramiz
+            if chat_ref.startswith("@"):
+                chat_ref = chat_ref
+            else:
+                try:
+                    chat_ref = int(chat_ref)
+                except ValueError:
+                    chat_ref = chat_ref
+            
+            # Bot API orqali foydalanuvchining status'ini tekshiramiz
+            member = await bot.get_chat_member(chat_ref, user_id)
+            
+            # Agar status member/administrator/creator emas bo'lsa → obuna bo'lmagan
+            if member.status not in ("member", "administrator", "creator"):
+                not_sub.append(ch)
+        except Exception:
+            # Bot kanalga kirish mumkin bo'lmasa yoki xatolik bo'lsa → obuna bo'lmagan deb hisoblash
+            not_sub.append(ch)
+    
+    return not_sub
+
+
+def sub_required_markup(channels: list[str]):
+    """
+    Majburiy kanallarning inline tugma bilan keyboard'ini yasaydi.
+    
+    Input: channels = ["@channel1", "@channel2"]
+    Output: InlineKeyboardMarkup bilan kanallar va "Tekshirish" tugmasi
+    """
+    buttons = [
+        [InlineKeyboardButton(text=f"📢 {ch}", url=f"https://t.me/{ch.lstrip('@')}")]
+        for ch in channels
+    ]
+    buttons.append([InlineKeyboardButton(text='✅ Tekshirish', callback_data="check_subs")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# 3️⃣ GUARD FUNKSIYASI (bosh tekshirish)
+
+async def guard_common(message: Message, allow_ai: bool = False) -> bool:
+    """
+    Foydalanuvchi private chatligi va kanalga obuna bo'lganligini tekshiradi.
+    
+    Args:
+        message: Telegram xabari
+        allow_ai: True bo'lsa, tanaffus muddatida faqat AI bo'limi ishga yuboriladi
+    
+    Return:
+        - True: Oqim to'xtatirilishi kerak (obuna bo'lmagan yoki tanaffus)
+        - False: Oqim davom ettirilishi kerak (hammasi OK)
+    """
+    
+    # Faqat private chatdan ruxsat beramiz
+    if message.chat.type != "private":
+        return False
+    
+    # 1️⃣ Tanaffus tekshiruvi (DB orqali)
+    remain = await get_suspension_remaining(message.from_user.id)
+    if remain > 0 and not allow_ai:
+        await message.answer(
+            '😴 Siz hozircha tanaffusdasiz.\n'
+            f"⏰ {remain} soniyadan so'ng bot qayta faollashadi.\n\n"
+            "Ushbu muddatda faqat <b>🧠 AI bilan suhbat</b> bo'limidan foydalanishingiz mumkin.",
+            parse_mode="HTML"
+        )
+        return True
+    
+    # 2️⃣ Majburiy obuna tekshiruvi
+    not_sub = await check_subscription(message.from_user.id)
+    if not_sub:
+        await message.answer(
+            '🔒 <b>Obuna talab qilinadi</b>\n\n'
+            "Quyidagi kanallarimizga a'zo bo'ling, so'ng <b>✅ Tekshirish</b> tugmasini bosing.",
+            parse_mode="HTML", 
+            reply_markup=sub_required_markup(not_sub)
+        )
+        return True
+    
+    return False
+
+
+# 4️⃣ CALLBACK: OBUNANI QAYTA TEKSHIRISH
+
+@router.callback_query(F.data == "check_subs")
+async def recheck_subs(cb: CallbackQuery, state: FSMContext):
+    '\n    "✅ Tekshirish" tugmasiga bosish handler.\n    \n    Qo\'llanish:\n    1. Foydalanuvchi kanalga a\'zo bo\'ladi\n    2. "✅ Tekshirish" tugmasini bosadi\n    3. Bot qayta obuna holatini tekshiradi\n    4. Agar hamma kanalga obuna bo\'lgan bo\'lsa → davom etamiz\n    '
+    
+    # State'ni TOZALAMAYMIZ - ref_id saqlanadi!
+    not_sub = await check_subscription(cb.from_user.id)
+    
+    if not_sub:
+        # Hali ba'zi kanallarga obuna bo'lmagan
+        return await cb.message.edit_text(
+            "⚠️ Hali barcha kanallarga obuna bo'lmagansiz.\n"
+            "Quyidagilarga obuna bo'ling va qayta tekshiring.",
+            reply_markup=sub_required_markup(not_sub)
+        )
+    
+    # ✅ Barcha kanalga obuna bo'lgan!
+    await cb.message.edit_text('✅ Obuna tasdiqlandi! Davom etamiz…')
+    
+    # /start ni qayta chaqiramiz (davom etish uchun)
+    await start_handler(cb.message, state)
+
+
+async def _open_admin_panel(message: Message, state: FSMContext):
+    role = await get_admin_role(message.from_user.id)
+    if not role:
+        await message.answer(
+            "? Sizda ruxsat yo'q",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="?? Asosiy Menyu", callback_data="back_to_menu")]]
+            ),
+        )
+        return
+
+    await state.set_state(AdminMenuStates.menu)
+    await state.update_data(**{ADMIN_NAV_STACK_KEY: []})
+    await push_nav(state, "admin_menu")
+    await show_admin_menu(message, state)
+
+
+@router.message(StateFilter("*"), Command("admin"))
+async def admin_panel_command_any_state(message: Message, state: FSMContext):
+    await _open_admin_panel(message, state)
+
+
+@router.message(F.text == '🧩 Majburiy kanallar')
+async def channels_menu(message: Message, state: FSMContext):
+    """
+    Admin paneli: Majburiy kanallar ro'yxatini ko'rish va tahriri.
+    """
+    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+        return
+    
+    channels = await list_required_channels()
+    text = '🧩 <b>Majburiy kanallar</b>\n\n' + (
+        "\n".join(f"• {ch}" for ch in channels) 
+        if channels 
+        else "— Hozircha kanal yo'q."
+    )
+    
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="➕ Kanal qo'shish"), KeyboardButton(text="➖ Kanal o'chirish")],
+            [KeyboardButton(text='⬅️ Chiqish')]
+        ], 
+        resize_keyboard=True
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.message(F.text == "➕ Kanal qo'shish")
+async def channel_add_prompt(message: Message, state: FSMContext):
+    """Kanal qo'shish - Admin"""
+    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+        return
+    
+    cnt = await required_channels_count()
+    if cnt >= 6:
+        return await message.answer('⚠️ 6 tadan ortiq kanal ulash mumkin emas.')
+    
+    await state.set_state(ChanManage.ADD)
+    await message.answer(
+        "Kanal username'ini yuboring (masalan: @mychannel yoki -100... ID):",
+        reply_markup=back_kb
+    )
+
+
+@router.message(StateFilter(ChanManage.ADD))
+async def channel_add(message: Message, state: FSMContext):
+    """Kanalni bazaga qo'shish"""
+    ch = (message.text or "").strip()
+    
+    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+        return
+    
+    # Orqaga tugmasi
+    if ch == '⬅️ Orqaga':
+        await state.clear()
+        return await message.answer('❎ Bekor qilindi.', reply_markup=admin_menu)
+    
+    # Formatni tekshirish
+    if not (ch.startswith("@") or ch.startswith("-100") or ch.lstrip("-").isdigit()):
+        return await message.answer(
+            '⚠️ Iltimos, @username yoki -100... chat ID yuboring.'
+        )
+    
+    # Bazaga qo'shish
+    ok = await add_required_channel(ch)
+    await state.clear()
+    
+    if ok:
+        await message.answer("✅ Kanal qo'shildi.", reply_markup=admin_menu)
+    else:
+        await message.answer("?? Bu kanal allaqachon mavjud.", reply_markup=admin_menu)
+
+
+@router.message(F.text == "➖ Kanal o'chirish")
+async def channel_remove_prompt(message: Message, state: FSMContext):
+    """Kanal o'chirish - Admin"""
+    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+        return
+    
+    await state.set_state(ChanManage.REMOVE)
+    await message.answer(
+        "O'chirish uchun @username yoki -100... chat ID yuboring:",
+        reply_markup=back_kb
+    )
+
+@router.message(F.text == '⬅️ Chiqish')
+async def exit_channels_menu(message: Message, state: FSMContext):
+    await state.clear()
+    await show_admin_menu(message, state)
+    
+@router.message(StateFilter(ChanManage.REMOVE))
+async def channel_remove(message: Message, state: FSMContext):
+    """Kanalni bazadan o'chirish"""
+    ch = (message.text or "").strip()
+    
+    if not (message.from_user.id == OWNER_ID or await is_admin(message.from_user.id)):
+        return
+    
+    # Orqaga tugmasi
+    if ch == '⬅️ Orqaga':
+        await state.clear()
+        return await message.answer('❎ Bekor qilindi.', reply_markup=admin_menu)
+    
+    # Bazadan o'chirish
+    ok = await remove_required_channel(ch)
+    await state.clear()
+    
+    if ok:
+        await message.answer("✅ Kanal o'chirildi.", reply_markup=admin_menu)
+    else:
+        await message.answer("?? Bunday kanal topilmadi.", reply_markup=admin_menu)
+
 MAIN_MENU_TEXT = (
-    "🎮 Free Fire uchun Almaz — ishonch bilan, tez va xotirjam.\n\n"
+    "?? FREE FIRE DONAT MARKAZI\n\n"
 
-    "Bu yerda siz shunchaki almaz sotib olmaysiz —\n"
-    "siz xavfsizlik, tezlik va halollikni tanlaysiz.\n\n"
+    "O'yin hisobingizni kuchaytirish vaqti keldi.\n"
+    "Bu yerda siz Free Fire uchun kerakli almazlarni\n"
+    "tezkor, xavfsiz va ishonchli tarzda xarid qilishingiz mumkin.\n\n"
 
-    "⚡ O‘rtacha yetkazish: 5–15 daqiqa\n"  
-    "🔒 Hisobingiz xavfsizligi — 1-o‘rinda\n"  
-    "👮‍♂️ Adminlar real va onlayn\n"  
-    "🎁 Bonuslar va sovg‘alar mavjud\n\n"
+    "?? Eng mashhur almaz paketlari\n"
+    "? Buyurtmalar adminlar tomonidan tez tasdiqlanadi\n"
+    "?? 100% xavfsiz va tekshirilgan to'lov jarayoni\n\n"
 
-    "💬 Minglab foydalanuvchilar bizni tanlagan.\n"
+    "?? Minglab o'yinchilar allaqachon xizmatimizdan foydalanmoqda.\n"
     "Endi navbat sizda.\n\n"
 
-    "👇 Boshlash uchun quyidan kerakli bo‘limni tanlang.\n"
+    "?? O'yinda ustunlikka erishish uchun\n"
+    "almaz donat qilishni hozir boshlang.\n\n"
+
+    "?? Davom etish uchun kerakli bo'limni tanlang."
 )
 
 ADMIN_ROLE_SUPER = "superadmin"
@@ -152,7 +464,7 @@ async def show_admin_menu(message: Message, state: FSMContext | None = None):
         await state.set_state(AdminMenuStates.menu)
     role = await get_admin_role(message.from_user.id)
     await message.answer(
-        "🛠 ADMIN PANEL\n\nKerakli bo‘limni tanlang:",
+        "🛠 ADMIN PANEL\n\nKerakli bo'limni tanlang:",
         reply_markup=admin_menu_keyboard(role)
     )
 
@@ -161,13 +473,13 @@ async def show_admin_roles_menu(message: Message, state: FSMContext):
     rows = await db.fetch(
         "SELECT user_id, role, active FROM admins ORDER BY role, user_id"
     )
-    text = "👮‍♂️ <b>ADMINLAR</b>\n\n"
+    text = '👮\u200d♂️ <b>ADMINLAR</b>\n\n'
     if not rows:
-        text += "Hozircha adminlar yo‘q."
+        text += "Hozircha adminlar yo'q."
     else:
         for row in rows:
             r = row["role"]
-            status = "🟢" if row["active"] else "🔴"
+            status = '🟢' if row["active"] else '🔴'
             text += f"{status} {row['user_id']} — {ROLE_LABELS.get(r, r)}\n"
     await state.set_state(AdminRoleStates.menu)
     await message.answer(text, reply_markup=admin_roles_menu_keyboard())
@@ -175,25 +487,25 @@ async def show_admin_roles_menu(message: Message, state: FSMContext):
 
 async def show_admin_promocode_menu(message: Message, state: FSMContext):
     await state.set_state(AdminPromoStates.menu)
-    await message.answer("🎁 PROMOKODLAR BOSHQARUVI", reply_markup=admin_promocode_menu_keyboard())
+    await message.answer('🎁 PROMOKODLAR BOSHQARUVI', reply_markup=admin_promocode_menu_keyboard())
 
 
 async def show_admin_vouchers_menu(message: Message, state: FSMContext):
     await state.set_state(AdminVouchersStates.menu)
-    await message.answer("💳 VOUCHERLAR BOSHQARUVI", reply_markup=admin_vouchers_menu_keyboard())
+    await message.answer('💳 VOUCHERLAR BOSHQARUVI', reply_markup=admin_vouchers_menu_keyboard())
 
 
 async def show_admin_packages_menu(message: Message, state: FSMContext):
     await state.set_state(AdminPackagesStates.menu)
-    await message.answer("📦 PAKETLAR BOSHQARUVI", reply_markup=admin_packages_menu_keyboard())
+    await message.answer('📦 PAKETLAR BOSHQARUVI', reply_markup=admin_packages_menu_keyboard())
 
 
 async def show_admin_payment_cards_menu(message: Message, state: FSMContext):
     await state.set_state(AdminPaymentCardsStates.menu)
     rows = await list_payment_cards(active_only=False)
-    text = "💳 <b>TO‘LOV KARTALARI</b>\n\n"
+    text = "💳 <b>TO'LOV KARTALARI</b>\n\n"
     if not rows:
-        text += "Hozircha karta yo‘q."
+        text += "Hozircha karta yo'q."
     else:
         for row in rows:
             text += format_card_line(row) + "\n"
@@ -238,16 +550,14 @@ def parse_role(text: str):
 def normalize_menu_text(text: str) -> str:
     t = (text or "").lower()
     t = (
-        t.replace("␔", "-")
-        .replace("—", "-")
-        .replace("–", "-")
-        .replace("␘", "'")
-        .replace("␙", "'")
-        .replace("’", "'")
-        .replace("`", "'")
+        t.replace("?", "-")
+        .replace("?", "-")
+        .replace("?", " ")
+        .replace("?", " ")
+        .replace("`", " ")
     )
     t = re.sub(r"[\U00010000-\U0010ffff]", " ", t)
-    t = re.sub(r"[^a-z0-9а-яёўқғҳ\s'\\-]+", " ", t)
+    t = re.sub(r"[^a-z0-9\u0400-\u04ff\s'\\-]+", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
@@ -356,7 +666,7 @@ def format_card_line(row) -> str:
         parts.append(f"{row['bank_name']}")
     if row.get("holder_name"):
         parts.append(f"{row['holder_name']}")
-    active_mark = "✅" if row.get("active") else "⛔"
+    active_mark = '✅' if row.get("active") else '⛔'
     return f"{active_mark} {' — '.join(parts)} (ID: {row['id']})"
 
 
@@ -369,6 +679,42 @@ async def list_payment_cards(active_only: bool = False):
         {where}
         ORDER BY active DESC, sort_order ASC, id ASC
         """
+    )
+
+
+def build_payment_stage_text(active_cards: list) -> str:
+    cards_blocks: list[str] = []
+    for c in active_cards:
+        title = (c.get("bank_name") or "Karta").strip()
+        number = (c.get("card_number") or "").strip()
+        holder = (c.get("holder_name") or "").strip()
+        block_lines = [number]
+        if holder:
+            block_lines.append(holder)
+        cards_blocks.append(f"{title}:\n" + "\n".join(block_lines))
+
+    if cards_blocks:
+        cards_text = "\n\n".join(cards_blocks)
+    else:
+        cards_text = (
+            "Karta:\n"
+            "6262570026129033\n"
+            "m.a\n\n"
+            "Karta:\n"
+            "1234567777\n\n"
+            "Uzcard:\n"
+            "272716222718\n"
+            "Palonchiyev Pistonchi"
+        )
+
+    return (
+        "💳 TO'LOV BOSQICHI\n\n"
+        '🏦 Karta raqamlari:\n\n'
+        f"{cards_text}\n\n"
+        "📌 To'lovni amalga oshiring va\n"
+        '🧾 chekni rasm qilib shu yerga yuboring.\n\n'
+        "⚡ To'lov tasdiqlangach, buyurtma tezkor ko'rib chiqiladi.\n"
+        "🔒 Jarayon xavfsiz va qo'lda tekshiriladi."
     )
 
 
@@ -391,7 +737,7 @@ async def get_log_channel_chat_id():
 
 async def resolve_log_channel_id(bot):
     if not await is_log_enabled():
-        return None, "Log o‘chirilgan."
+        return None, "Log o'chirilgan."
     chat_id = await get_log_channel_chat_id()
     if chat_id:
         return chat_id, None
@@ -405,11 +751,11 @@ async def resolve_log_channel_id(bot):
         await set_setting("approved_channel_chat_id", str(chat.id))
         return chat.id, None
     except TelegramBadRequest:
-        return None, "Kanal topilmadi. Username noto‘g‘ri yoki bot kanalga qo‘shilmagan."
+        return None, "Kanal topilmadi. Username noto'g'ri yoki bot kanalga qo'shilmagan."
     except TelegramForbiddenError:
-        return None, "Bot kanalga yozolmayapti. Botni kanalga admin qilib qo‘ying."
+        return None, "Bot kanalga yozolmayapti. Botni kanalga admin qilib qo'ying."
     except Exception:
-        return None, "Kanalni tekshirib bo‘lmadi."
+        return None, "Kanalni tekshirib bo'lmadi."
 
 
 async def mark_order_log_sent(order_id: int, status: str):
@@ -466,30 +812,30 @@ async def send_order_log_if_needed(bot, order_id: int, status: str, status_label
         return None
 
     user_full = order["first_name"] or "Anonim"
-    username = f"@{order['username']}" if order["username"] else "yo‘q"
+    username = f"@{order['username']}" if order["username"] else "yo'q"
     admin_name = admin_display_name(admin_user)
     time_str = format_dt_utc5(order["updated_at"])
 
     if (order["product_type"] or "").lower() == "voucher":
         product_block = (
-            "💳 VOUCHER MA’LUMOTI\n"
+            "💳 VOUCHER MA'LUMOTI\n"
             f"🎫 Nomi: {order['product_name']}\n"
             f"🧮 Soni: {order['quantity']} dona\n"
             f"💎 Jami almaz: {order['almaz']}\n"
-            f"💰 Jami narx: {order['price']:,} so‘m\n"
+            f"💰 Jami narx: {order['price']:,} so'm\n"
             f"🎮 FF ID: {order['ff_id']}\n"
         )
     else:
         product_block = (
-            "💎 PAKET MA’LUMOTI\n"
+            "💎 PAKET MA'LUMOTI\n"
             f"📦 Paket: {order['product_name']}\n"
             f"💎 Almaz: {order['almaz']}\n"
-            f"💰 Narx: {order['price']:,} so‘m\n"
+            f"💰 Narx: {order['price']:,} so'm\n"
             f"🎮 FF ID: {order['ff_id']}\n"
         )
 
     text = (
-        "🧾 YANGI BUYURTMA\n"
+        '🧾 YANGI BUYURTMA\n'
         f"🧾 Buyurtma raqami: #{order['id']}\n"
         f"👤 Foydalanuvchi: {user_full}\n"
         f"🔗 Username: {username}\n"
@@ -517,10 +863,10 @@ async def send_order_log_if_needed(bot, order_id: int, status: str, status_label
         return None
     except TelegramBadRequest:
         print(f"LOG CHAT NOT FOUND order_id={order_id}")
-        return "Log kanalga yuborilmadi: chat not found. Botni kanalga qo‘shing va admin qiling yoki username’ni tekshiring."
+        return "Log kanalga yuborilmadi: chat not found. Botni kanalga qo'shing va admin qiling yoki username'ni tekshiring."
     except TelegramForbiddenError:
         print(f"LOG CHAT FORBIDDEN order_id={order_id}")
-        return "Bot kanalga yozolmayapti. Botni kanalga admin qilib qo‘ying."
+        return "Bot kanalga yozolmayapti. Botni kanalga admin qilib qo'ying."
     except Exception as e:
         print(f"LOG SEND ERROR order_id={order_id} err={e}")
         return "Log kanalga yuborilmadi. Kanal sozlamasini tekshiring."
@@ -532,7 +878,7 @@ async def send_withdraw_log_if_needed(bot, request_id: int, admin_user):
 
     req = await get_withdraw_request(request_id)
     if not req:
-        return "So‘rov topilmadi."
+        return "So'rov topilmadi."
     if req["status"] != "approved":
         return None
     if req["channel_posted_at"]:
@@ -542,7 +888,7 @@ async def send_withdraw_log_if_needed(bot, request_id: int, admin_user):
     user_name = f"@{user['username']}" if user and user["username"] else f"{req['user_id']}"
     time_str = format_dt_utc5(req["processed_at"])
     text = (
-        "✅ Tasdiqlandi\n\n"
+        '✅ Tasdiqlandi\n\n'
         f"👤 User: {user_name}\n"
         f"💎 Miqdor: {req['amount']} Almaz\n"
         f"🎮 FF ID: {req['ff_id']}\n"
@@ -562,10 +908,10 @@ async def send_withdraw_log_if_needed(bot, request_id: int, admin_user):
         return None
     except TelegramBadRequest:
         print(f"LOG CHAT NOT FOUND withdraw_id={request_id}")
-        return "Log kanalga yuborilmadi: chat not found. Botni kanalga qo‘shing va admin qiling yoki username’ni tekshiring."
+        return "Log kanalga yuborilmadi: chat not found. Botni kanalga qo'shing va admin qiling yoki username'ni tekshiring."
     except TelegramForbiddenError:
         print(f"LOG CHAT FORBIDDEN withdraw_id={request_id}")
-        return "Bot kanalga yozolmayapti. Botni kanalga admin qiling yoki kanal username noto‘g‘ri."
+        return "Bot kanalga yozolmayapti. Botni kanalga admin qiling yoki kanal username noto'g'ri."
     except Exception as e:
         print(f"LOG SEND ERROR withdraw_id={request_id} err={e}")
         return "Log kanalga yuborilmadi. Kanal sozlamasini tekshiring."
@@ -574,7 +920,7 @@ async def send_withdraw_log_if_needed(bot, request_id: int, admin_user):
 async def get_user(user_id: int):
     return await db.fetchrow(
         """
-        SELECT user_id, first_name, username, joined_at, almaz_balance, bonus_almaz, total_almaz
+        SELECT user_id, first_name, username, joined_at, almaz_balance, bonus_almaz, total_almaz, money_balance
         FROM users
         WHERE user_id = $1
         """,
@@ -592,6 +938,34 @@ async def add_almaz(user_id: int, amount: int):
         amount,
         user_id,
     )
+
+
+async def add_money_balance(user_id: int, amount: int):
+    await db.execute(
+        """
+        UPDATE users
+        SET money_balance = COALESCE(money_balance, 0) + $1
+        WHERE user_id = $2
+        """,
+        amount,
+        user_id,
+    )
+
+
+async def spend_money_balance(user_id: int, amount: int) -> bool:
+    if amount <= 0:
+        return False
+    result = await db.execute(
+        """
+        UPDATE users
+        SET money_balance = COALESCE(money_balance, 0) - $1
+        WHERE user_id = $2
+          AND COALESCE(money_balance, 0) >= $1
+        """,
+        amount,
+        user_id,
+    )
+    return str(result).endswith(" 1")
 
 
 def resolve_proof_chat_id(value: str | None):
@@ -651,6 +1025,52 @@ async def update_withdraw_status(request_id: int, status: str, processed_by: int
         utc_now(),
         processed_by,
         note,
+        request_id,
+    )
+
+
+async def create_balance_topup_request(user, check_photo_id: str) -> int:
+    return await db.fetchval(
+        """
+        INSERT INTO balance_topup_requests (
+            user_id, username, first_name, check_photo_id, status, amount, created_at
+        )
+        VALUES ($1, $2, $3, $4, 'pending', 0, $5)
+        RETURNING id
+        """,
+        user.id,
+        user.username,
+        user.first_name,
+        check_photo_id,
+        utc_now(),
+    )
+
+
+async def get_balance_topup_request(request_id: int):
+    return await db.fetchrow(
+        """
+        SELECT id, user_id, username, first_name, check_photo_id, status, amount, admin_id, created_at, processed_at
+        FROM balance_topup_requests
+        WHERE id = $1
+        """,
+        request_id,
+    )
+
+
+async def update_balance_topup_request(request_id: int, status: str, admin_id: int, amount: int = 0):
+    await db.execute(
+        """
+        UPDATE balance_topup_requests
+        SET status = $1,
+            amount = $2,
+            admin_id = $3,
+            processed_at = $4
+        WHERE id = $5
+        """,
+        status,
+        amount,
+        admin_id,
+        utc_now(),
         request_id,
     )
 
@@ -724,7 +1144,7 @@ async def update_withdraw_admin_messages(bot, request_id: int, status_label: str
     almaz = user["almaz_balance"] if user else 0
 
     created_str = format_dt_utc5(created_at)
-    processed_str = format_dt_utc5(processed_at) if processed_at else "—"
+    processed_str = format_dt_utc5(processed_at) if processed_at else '—'
     note_part = f"\n📝 Izoh: {note}" if note else ""
 
     base_text = (
@@ -769,7 +1189,7 @@ async def send_proof_receipt(bot, request_id: int, user_id: int, amount: int, ff
     now_str = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
 
     text = (
-        "✅ <b>Almaz yechish tasdiqlandi</b>\n\n"
+        '✅ <b>Almaz yechish tasdiqlandi</b>\n\n'
         f"👤 Foydalanuvchi: {mention} (ID: <code>{user_id}</code>)\n"
         f"🎮 Free Fire ID: <code>{ff_value}</code>\n"
         f"💎 Miqdor: <b>{amount} Almaz</b>\n"
@@ -815,9 +1235,9 @@ async def notify_admins_about_withdraw(bot, request_id: int):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"wd_ok:{request_id}"),
-                InlineKeyboardButton(text="✏️ Tahrirlash", callback_data=f"withdraw:edit:{request_id}"),
-                InlineKeyboardButton(text="❌ Rad etish", callback_data=f"wd_reject:{request_id}"),
+                InlineKeyboardButton(text='✅ Tasdiqlash', callback_data=f"wd_ok:{request_id}"),
+                InlineKeyboardButton(text='✏️ Tahrirlash', callback_data=f"withdraw:edit:{request_id}"),
+                InlineKeyboardButton(text='❌ Rad etish', callback_data=f"wd_reject:{request_id}"),
             ]
         ]
     )
@@ -877,7 +1297,15 @@ async def update_admin_order_messages(bot, order_id: int, new_status_label: str,
                 reply_markup=None,
             )
         except Exception:
-            pass
+            try:
+                await bot.edit_message_text(
+                    chat_id=row["admin_id"],
+                    message_id=row["message_id"],
+                    text=new_caption,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
         await db.execute(
             """
             UPDATE admin_order_messages
@@ -907,25 +1335,25 @@ async def update_admin_order_field_messages(bot, order_id: int, field: str, valu
         caption = row["caption"] or ""
         if field == "almaz":
             new_line = f"💎 Almaz: {value}"
-            if "💎 Jami almaz:" in caption:
+            if '💎 Jami almaz:' in caption:
                 new_line = f"💎 Jami almaz: {value}"
-                caption = replace_caption_line(caption, ["💎 Jami almaz:"], new_line)
+                caption = replace_caption_line(caption, ['💎 Jami almaz:'], new_line)
             else:
-                caption = replace_caption_line(caption, ["💎 Almaz:"], new_line)
+                caption = replace_caption_line(caption, ['💎 Almaz:'], new_line)
         elif field == "price":
-            new_line = f"💰 Narx: {format_money(value)} so‘m"
-            if "💰 Jami narx:" in caption:
-                new_line = f"💰 Jami narx: {format_money(value)} so‘m"
-                caption = replace_caption_line(caption, ["💰 Jami narx:"], new_line)
+            new_line = f"💰 Narx: {format_money(value)} so'm"
+            if '💰 Jami narx:' in caption:
+                new_line = f"💰 Jami narx: {format_money(value)} so'm"
+                caption = replace_caption_line(caption, ['💰 Jami narx:'], new_line)
             else:
-                caption = replace_caption_line(caption, ["💰 Narx:"], new_line)
+                caption = replace_caption_line(caption, ['💰 Narx:'], new_line)
         elif field == "ff_id":
-            caption = replace_caption_line(caption, ["🎮 FF ID:"], f"🎮 FF ID: {value}")
+            caption = replace_caption_line(caption, ['🎮 FF ID:'], f"🎮 FF ID: {value}")
         elif field == "product_name":
-            if "🎫 Nomi:" in caption:
-                caption = replace_caption_line(caption, ["🎫 Nomi:"], f"🎫 Nomi: {value}")
+            if '🎫 Nomi:' in caption:
+                caption = replace_caption_line(caption, ['🎫 Nomi:'], f"🎫 Nomi: {value}")
             else:
-                caption = replace_caption_line(caption, ["📦 Paket:"], f"📦 Paket: {value}")
+                caption = replace_caption_line(caption, ['📦 Paket:'], f"📦 Paket: {value}")
 
         caption = append_admin_info(caption, acting_admin_name, acting_admin_id)
         try:
@@ -936,7 +1364,15 @@ async def update_admin_order_field_messages(bot, order_id: int, field: str, valu
                 reply_markup=None,
             )
         except Exception:
-            pass
+            try:
+                await bot.edit_message_text(
+                    chat_id=row["admin_id"],
+                    message_id=row["message_id"],
+                    text=caption,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
         await db.execute(
             """
             UPDATE admin_order_messages
@@ -951,6 +1387,8 @@ async def update_admin_order_field_messages(bot, order_id: int, field: str, valu
 
 
 async def get_admin_role(user_id: int):
+    if user_id in SUPERADMIN_IDS:
+        return ADMIN_ROLE_SUPER
     row = await db.fetchrow(
         "SELECT role FROM admins WHERE user_id = $1 AND active = TRUE",
         user_id,
@@ -972,7 +1410,7 @@ async def is_admin(user_id: int) -> bool:
 async def require_role(message: Message, roles: tuple[str, ...]):
     role = await get_admin_role(message.from_user.id)
     if role not in roles:
-        await message.answer("⛔ Sizda ruxsat yo‘q")
+        await message.answer("⛔ Sizda ruxsat yo'q")
         return None
     return role
 
@@ -1000,28 +1438,92 @@ async def get_main_menu_text() -> str:
     return text if text else MAIN_MENU_TEXT
 
 
+async def list_content_button_labels() -> list[str]:
+    rows = await db.fetch(
+        """
+        SELECT label
+        FROM content_buttons
+        ORDER BY id
+        """
+    )
+    return [row["label"] for row in rows if (row["label"] or "").strip()]
+
+
+async def get_content_button_by_label(label: str):
+    return await db.fetchrow(
+        """
+        SELECT id, label, source_chat_id, source_message_id, content_type, admin_id
+        FROM content_buttons
+        WHERE label = $1
+        """,
+        (label or "").strip(),
+    )
+
+
+async def find_content_button_by_label(label: str):
+    return await db.fetchrow(
+        """
+        SELECT id, label, source_chat_id, source_message_id, content_type, admin_id, updated_at
+        FROM content_buttons
+        WHERE lower(label) = lower($1)
+        LIMIT 1
+        """,
+        (label or "").strip(),
+    )
+
+
+async def list_content_buttons():
+    return await db.fetch(
+        """
+        SELECT id, label, content_type, admin_id, updated_at
+        FROM content_buttons
+        ORDER BY label
+        """
+    )
+
+
+async def build_main_menu_reply_markup():
+    return main_menu_keyboard(await list_content_button_labels())
+
+
+async def send_content_button_payload(bot: Bot, chat_id: int, row) -> bool:
+    if not row:
+        return False
+    try:
+        await bot.copy_message(
+            chat_id=chat_id,
+            from_chat_id=row["source_chat_id"],
+            message_id=row["source_message_id"],
+        )
+        return True
+    except Exception:
+        return False
+
+
 async def show_main_menu_message(message: Message, text: str | None = None):
     if not text:
         text = await get_main_menu_text()
     photo_id = (await get_setting("main_menu_photo_id")).strip()
+    reply_markup = await build_main_menu_reply_markup()
     if photo_id:
-        await message.answer_photo(photo_id, caption=text, reply_markup=main_menu_keyboard())
+        await message.answer_photo(photo_id, caption=text, reply_markup=reply_markup)
     else:
-        await message.answer(text, reply_markup=main_menu_keyboard())
+        await message.answer(text, reply_markup=reply_markup)
 
 
 async def show_main_menu_callback(callback: CallbackQuery, text: str | None = None):
     if not text:
         text = await get_main_menu_text()
     photo_id = (await get_setting("main_menu_photo_id")).strip()
+    reply_markup = await build_main_menu_reply_markup()
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
     if photo_id:
-        try:
-            await callback.message.delete()
-        except Exception:
-            pass
-        await callback.message.answer_photo(photo_id, caption=text, reply_markup=main_menu_keyboard())
+        await callback.message.answer_photo(photo_id, caption=text, reply_markup=reply_markup)
     else:
-        await callback.message.edit_text(text, reply_markup=main_menu_keyboard())
+        await callback.message.answer(text, reply_markup=reply_markup)
 
 
 async def safe_edit(callback: CallbackQuery, text: str, reply_markup=None, allow_photo: bool = False):
@@ -1123,12 +1625,12 @@ async def get_active_bonus_code(user_id: int):
 
 async def build_bonus_menu_text(user_id: int):
     base = (
-        "🎁 Bonusli kod orqali donat — foydaliroq xarid.\n\n"
-        "Bu bo‘limda siz:\n"
-        "• o‘zingizga bonus kod yaratasiz\n"
-        "• do‘stlaringiz bilan bo‘lishasiz\n"
-        "• har bir xariddan bonus olasiz\n\n"
-        "👇 Boshlash uchun quyidagi tugmalardan foydalaning."
+        '🎁 Bonusli kod orqali donat — foydaliroq xarid.\n\n'
+        "Bu bo'limda siz:\n"
+        "• o'zingizga bonus kod yaratasiz\n"
+        "• do'stlaringiz bilan bo'lishasiz\n"
+        '• har bir xariddan bonus olasiz\n\n'
+        '👇 Boshlash uchun quyidagi tugmalardan foydalaning.'
     )
 
     return base
@@ -1138,36 +1640,36 @@ async def build_bonus_menu_text(user_id: int):
 def build_bonus_code_card(code: str, expires_at) -> str:
     exp_text = format_dt_utc5(expires_at)
     return (
-        "✅ <b>Sizda aktiv kod bor:</b>\n\n"
+        '✅ <b>Sizda aktiv kod bor:</b>\n\n'
         f"🎁 Kod: <code>{code}</code>\n"
         f"⏳ Tugash: {exp_text}\n\n"
         "Kod tugagach yangisini yaratishingiz mumkin."
     )
 
 def update_order_status(caption: str, new_status: str) -> str:
-    if "📌 Holat:" in caption:
+    if '📌 Holat:' in caption:
         lines = caption.split("\n")
         updated_lines = []
 
         for line in lines:
-            if line.startswith("📌 Holat:"):
+            if line.startswith('📌 Holat:'):
                 updated_lines.append(f"📌 Holat: {new_status}")
             else:
                 updated_lines.append(line)
 
         return "\n".join(updated_lines)
 
-    # agar holat qatori bo‘lmasa (kam ehtimol)
+    # agar holat qatori bo'lmasa (kam ehtimol)
     return caption + f"\n\n📌 Holat: {new_status}"
 
 
 def append_admin_info(caption: str, admin_name: str, admin_id: int) -> str:
     admin_line = f"👮 Admin: {admin_name} ({admin_id})"
-    if "👮 Admin:" in caption:
+    if '👮 Admin:' in caption:
         lines = caption.split("\n")
         updated = []
         for line in lines:
-            if line.startswith("👮 Admin:"):
+            if line.startswith('👮 Admin:'):
                 updated.append(admin_line)
             else:
                 updated.append(line)
@@ -1208,16 +1710,16 @@ def parse_admin_int_input(raw: str) -> int | None:
 def validate_voucher_numeric_value(field: str, raw: str) -> tuple[int | None, str | None]:
     value = parse_admin_int_input(raw)
     if value is None:
-        return None, "❌ Faqat raqam kiriting (masalan: 19000, 19,000 yoki 19 000)"
+        return None, '❌ Faqat raqam kiriting (masalan: 19000, 19,000 yoki 19 000)'
 
     if field == "price":
         if value < 1000 or value > 10_000_000:
-            return None, "❌ Narx 1,000 dan 10,000,000 gacha bo‘lishi kerak"
+            return None, "❌ Narx 1,000 dan 10,000,000 gacha bo'lishi kerak"
         return value, None
 
     if field == "almaz":
         if value < 1 or value > 1_000_000:
-            return None, "❌ Almaz miqdori 1 dan 1,000,000 gacha bo‘lishi kerak"
+            return None, "❌ Almaz miqdori 1 dan 1,000,000 gacha bo'lishi kerak"
         return value, None
 
     return value, None
@@ -1286,6 +1788,17 @@ async def start_handler(message: Message, state: FSMContext):
         user.username,
         utc_now(),
     )
+    # ➤ Majburiy kanal tekshiruvi
+    not_sub = await check_subscription(message.from_user.id)
+
+    if not_sub:
+        await message.answer(
+            "📣 Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling.\n\n"
+            "Obuna bo'lgach, pastdagi <b>✅ Tekshirish</b> tugmasini bosing.",
+            parse_mode="HTML",
+            reply_markup=sub_required_markup(not_sub)
+        )
+        return
 
     role = await get_admin_role(user.id)
     await state.update_data(**{ADMIN_NAV_STACK_KEY: []})
@@ -1297,150 +1810,162 @@ async def start_handler(message: Message, state: FSMContext):
 
 
 
-# ================= BONUS CODE MENU =================
-@router.callback_query(F.data == "bonus_code_menu")
-async def bonus_code_menu_handler(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(BonusCodeStates.menu)
-
-    text = await build_bonus_menu_text(callback.from_user.id)
-    await safe_edit(callback, text, reply_markup=bonus_code_menu_keyboard())
-    await callback.answer()
-
-
-@router.callback_query(F.data == "bonus_code_create")
-async def bonus_code_create_handler(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(BonusCodeStates.menu)
-    user_id = callback.from_user.id
-    now = utc_now()
-
-    existing = await get_active_bonus_code(user_id)
-    if existing:
-        card_text = build_bonus_code_card(existing["code"], existing["expires_at"])
-        back_keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="bonus_code_menu")]]
-        )
-        await safe_edit(callback, card_text, reply_markup=back_keyboard)
-        await callback.answer()
+async def open_buy_almaz_from_message(message: Message, state: FSMContext):
+    rows = await db.fetch(
+        "SELECT id, name, almaz, price FROM packages WHERE active = TRUE"
+    )
+    if not rows:
+        await message.answer("Paketlar hozircha mavjud emas.")
         return
 
-    code = None
-    alphabet = string.ascii_uppercase + string.digits
-    for _ in range(10):
-        candidate = "".join(random.choices(alphabet, k=random.randint(6, 8)))
-        row = await db.fetchrow("SELECT 1 FROM bonus_codes WHERE code = $1", candidate)
-        if not row:
-            code = candidate
-            break
+    packages = [
+        {"id": r["id"], "name": r["name"], "almaz": r["almaz"], "price": r["price"]}
+        for r in rows
+    ]
+    await state.set_state(OrderStates.choosing_package)
+    await message.answer(
+        '💎 Free Fire almaz paketlari\n\n'
+        "O'yin hisobingizni kuchaytirish uchun kerakli paketni tanlang.\n"
+        "Har bir buyurtma adminlar tomonidan tezkor ko'rib chiqiladi.\n\n"
+        '⚡ Tezkor jarayon\n'
+        "🛡 Xavfsiz to'lov\n"
+        "🎮 O'yin ichida ustunlik\n\n"
+        "👇 O'zingizga mos paketni tanlang.",
+        reply_markup=dynamic_packages_keyboard(packages),
+    )
 
-    if not code:
-        await callback.answer("❌ Kod yaratishda xato, qayta urinib ko‘ring", show_alert=True)
-        return
 
-    expires_at = now + timedelta(days=4)
-
-    await db.execute(
+async def open_buy_voucher_from_message(message: Message, state: FSMContext):
+    rows = await db.fetch(
         """
-        INSERT INTO bonus_codes (code, owner_id, created_at, expires_at, active)
-        VALUES ($1, $2, $3, $4, TRUE)
-        """,
-        code,
-        user_id,
-        now,
-        expires_at,
-    )
-
-    card_text = build_bonus_code_card(code, expires_at)
-    back_keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="bonus_code_menu")]]
-    )
-    await safe_edit(callback, card_text, reply_markup=back_keyboard)
-    await callback.answer()
-
-
-@router.callback_query(F.data == "bonus_code_use")
-async def bonus_code_use_handler(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(BonusCodeStates.waiting_code_input)
-
-    back_keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="bonus_code_menu")]
-        ]
-    )
-
-    await safe_edit(
-        callback,
-        "🎁 <b>KODNI KIRITING</b>\n\n"
-        "Masalan:\n"
-        "<code>ZONIKS88</code>",
-        reply_markup=back_keyboard,
-    )
-    await callback.answer()
-
-
-@router.message(BonusCodeStates.waiting_code_input)
-async def bonus_code_use_input(message: Message, state: FSMContext):
-    code = message.text.strip().upper()
-    user_id = message.from_user.id
-    now = utc_now()
-
-    row = await db.fetchrow(
+        SELECT id, name, almaz, price
+        FROM vouchers
+        WHERE active = TRUE
+        ORDER BY
+            CASE
+                WHEN lower(name) LIKE '%oylik%' THEN 0
+                WHEN lower(name) LIKE '%haftalik%' THEN 1
+                ELSE 2
+            END,
+            id
         """
-        SELECT id, owner_id, expires_at, active
-        FROM bonus_codes
-        WHERE code = $1
-        """,
-        code,
     )
-
-    if not row or not row["active"]:
-        await message.answer("❌ Bunday kod mavjud emas yoki faol emas")
+    if not rows:
+        await message.answer("Voucherlar hozircha mavjud emas.")
         return
 
-    if row["expires_at"] and row["expires_at"] <= now:
-        await db.execute(
-            "UPDATE bonus_codes SET active = FALSE WHERE id = $1",
-            row["id"],
+    keyboard = []
+    for v in rows:
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"{v['id']}. {v['name']} - {v['price']:,} so'm",
+                callback_data=f"voucher:{v['id']}"
+            )
+        ])
+    keyboard.append([InlineKeyboardButton(text="Orqaga", callback_data="back_to_menu")])
+
+    await message.answer(
+        '💳 VOUCHER PAKETLARI\n\n'
+        "Free Fire uchun voucher orqali almaz olishni xohlaysizmi?\n"
+        "Quyidagi voucher paketlaridan birini tanlang.\n\n"
+        "⚡ Buyurtmalar tezkor ko'rib chiqiladi\n"
+        "🛡 Xavfsiz va tekshirilgan to'lov jarayoni\n\n"
+        '👇 Kerakli voucher paketini tanlang.',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+    )
+
+
+@router.message(
+    F.text.in_(
+        {
+            "?? Almaz olish",
+            "?? Voucher olish",
+            "?? Paket narxlari",
+            "?? Mening balansim",
+            "?? Yordam / Admin",
+            "?? Almaz sotib olish",
+            "?? Voucher sotib olish",
+            "?? Narxlar",
+            "?? Balans",
+            "?? Admin bilan bog'lanish",
+            "Almaz olish",
+            "Voucher olish",
+            "Paket narxlari",
+            "Mening balansim",
+            "Yordam / Admin",
+        }
+    )
+)
+async def user_main_menu_reply_router(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state and current_state.startswith("Admin"):
+        return
+
+    norm = normalize_menu_text(message.text or "")
+    if not norm:
+        return
+
+    if "almaz" in norm and ("sotib" in norm or "olish" in norm):
+        await state.clear()
+        await open_buy_almaz_from_message(message, state)
+        return
+    if "voucher" in norm and ("sotib" in norm or "olish" in norm):
+        await state.clear()
+        await open_buy_voucher_from_message(message, state)
+        return
+    if "narx" in norm:
+        await state.clear()
+        row = await db.fetchrow(
+            "SELECT value FROM settings WHERE key = $1",
+            "prices_text",
         )
-        await message.answer("⏰ Ushbu kod muddati tugagan")
+        prices_text = row["value"] if row else ""
+        await message.answer(prices_text, reply_markup=prices_back_inline())
+        return
+    if "balans" in norm:
+        await state.clear()
+        text = await build_balance_text(message.from_user.id, message.from_user.first_name)
+        if not text:
+            await message.answer("Foydalanuvchi topilmadi")
+            return
+        await message.answer(text, reply_markup=promo_enter_keyboard())
+        return
+    if "admin bilan bog" in norm:
+        await state.clear()
+        row = await db.fetchrow(
+            "SELECT value FROM settings WHERE key = $1",
+            "admin_contact_text",
+        )
+        text = row["value"] if row else "Admin bilan bog'lanish uchun admin yozing."
+        await message.answer(text, reply_markup=prices_back_inline())
         return
 
-    if row["owner_id"] == user_id:
-        await message.answer("⛔ Siz o‘zingiz yaratgan koddan foydalana olmaysiz")
+    content_row = await find_content_button_by_label(message.text or "")
+    if content_row:
+        await state.clear()
+        sent = await send_content_button_payload(message.bot, message.chat.id, content_row)
+        if not sent:
+            await message.answer(
+                "Saqlangan fayl/xabarni yuborib bo'lmadi. Admin eski xabarni o'chirgan bo'lishi mumkin."
+            )
+
+
+
+@router.message(StateFilter(None), F.text)
+async def user_dynamic_content_button_router(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state:
         return
 
-    await state.update_data(
-        bonus_code_id=row["id"],
-        bonus_owner_id=row["owner_id"],
-        bonus_code=code,
-    )
-    await state.set_state(BonusCodeStates.menu)
+    content_row = await find_content_button_by_label(message.text or "")
+    if not content_row:
+        return
 
-    use_state = await get_bonus_use_state(row["id"], user_id)
-    next_use_count = use_state["use_count"] + 1
-    bonus_bp = bonus_bp_for_use_count(next_use_count)
-    bonus_percent = bonus_bp / 100
-
-    progress = f"{min(next_use_count, 5)}/5" if next_use_count <= 5 else "6+"
-
-    text = (
-        "✅ <b>KOD QABUL QILINDI!</b>\n\n"
-        f"🔥 Joriy bonus: +{bonus_percent}%\n"
-        f"📈 Progress: {progress}\n"
-        f"🤝 Do‘stingiz ham +{bonus_percent}% oladi\n\n"
-        "Endi paket yoki voucher tanlang:"
-    )
-
-    await message.answer(text, reply_markup=bonus_code_buy_keyboard())
-
-
-@router.callback_query(F.data == "bonus_buy_almaz")
-async def bonus_buy_almaz_handler(callback: CallbackQuery, state: FSMContext):
-    await buy_almaz_handler(callback, state)
-
-
-@router.callback_query(F.data == "bonus_buy_voucher")
-async def bonus_buy_voucher_handler(callback: CallbackQuery, state: FSMContext):
-    await buy_voucher_handler(callback, state)
+    sent = await send_content_button_payload(message.bot, message.chat.id, content_row)
+    if not sent:
+        await message.answer(
+            "Saqlangan fayl/xabarni yuborib bo'lmadi. Admin eski xabarni o'chirgan bo'lishi mumkin."
+        )
 
 
 # ================= BUY FLOW =================
@@ -1451,7 +1976,7 @@ async def buy_almaz_handler(callback: CallbackQuery, state: FSMContext):
     )
 
     if not rows:
-        await callback.answer("❌ Hozircha paketlar mavjud emas", show_alert=True)
+        await callback.answer('❌ Hozircha paketlar mavjud emas', show_alert=True)
         return
 
     packages = [
@@ -1463,9 +1988,9 @@ async def buy_almaz_handler(callback: CallbackQuery, state: FSMContext):
 
     await safe_edit(
         callback,
-        "💎 Kerakli almaz paketini tanlang.\n\n"
+        '💎 Kerakli almaz paketini tanlang.\n\n'
 
-        "⚡ Tez yetkazish • 🔒 Xavfsiz • 🎁 Bonuslar mavjud",
+        '⚡ Tez yetkazish • 🔒 Xavfsiz • 🎁 Bonuslar mavjud',
         reply_markup=dynamic_packages_keyboard(packages)
     )
     await callback.answer()
@@ -1488,7 +2013,7 @@ async def back_to_packages_handler(callback: CallbackQuery, state: FSMContext):
     )
 
     if not rows:
-        await callback.answer("❌ Paketlar yo‘q", show_alert=True)
+        await callback.answer("❌ Paketlar yo'q", show_alert=True)
         return
 
     packages = [
@@ -1500,7 +2025,7 @@ async def back_to_packages_handler(callback: CallbackQuery, state: FSMContext):
 
     await safe_edit(
         callback,
-        "💎 Almaz paketini tanlang:",
+        '💎 Almaz paketini tanlang:',
         reply_markup=dynamic_packages_keyboard(packages)
     )
     await callback.answer()
@@ -1510,20 +2035,47 @@ async def back_to_packages_handler(callback: CallbackQuery, state: FSMContext):
 # ================= PAYMENT =================
 @router.callback_query(F.data == "go_to_payment")
 async def go_to_payment_handler(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(payment_mode="card")
     await state.set_state(OrderStates.waiting_ff_id)
 
     data = await state.get_data()
 
     await safe_edit(
         callback,
-        "✅ <b>BUYURTMA MA’LUMOTI</b>\n\n"
+        "✅ <b>BUYURTMA MA'LUMOTI</b>\n\n"
         f"💎 Paket: {data.get('almaz')} 💎\n"
-        f"💰 Narx: {data.get('price'):,} so‘m\n\n"
-        "🆔 <b>Free Fire ID</b> raqamingizni kiriting:\n"
+        f"💰 Narx: {data.get('price'):,} so'm\n\n"
+        '🆔 <b>Free Fire ID</b> raqamingizni kiriting:\n'
         "⚠️ <i>Diqqat: noto'g'ri ID jo'natilgan holatlarda Adminga murojaat qilishingiz kerak</i>"
     )
     await callback.answer()
 
+
+
+@router.callback_query(F.data == "pay_with_money_balance")
+async def pay_with_money_balance_handler(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    price = int(data.get("total_price", data.get("price", 0)) or 0)
+    user = await get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("Foydalanuvchi topilmadi", show_alert=True)
+        return
+
+    money_sum = int(user["money_balance"] or 0)
+    if money_sum < price:
+        await callback.answer("❌ So'm balans yetarli emas", show_alert=True)
+        return
+
+    await state.update_data(payment_mode="money_balance")
+    await state.set_state(OrderStates.waiting_ff_id)
+    await safe_edit(
+        callback,
+        "✅ <b>SO'M BALANSDAN TO'LOV</b>\n\n"
+        f"💰 Joriy so'm balans: {money_sum:,} so'm\n"
+        f"💸 Yechiladigan summa: {price:,} so'm\n\n"
+        '🆔 <b>Free Fire ID</b> raqamingizni kiriting:',
+    )
+    await callback.answer()
 
 
 @router.message(OrderStates.waiting_ff_id)
@@ -1531,43 +2083,124 @@ async def ff_id_handler(message: Message, state: FSMContext):
     ff_id = message.text.strip()
 
     if not ff_id.isdigit():
-        await message.answer("❌ FF ID faqat raqamlardan iborat bo‘lishi kerak")
+        await message.answer("❌ FF ID faqat raqamlardan iborat bo'lishi kerak")
         return
 
     await state.update_data(ff_id=ff_id)
-    await state.set_state(OrderStates.waiting_payment)
+    data = await state.get_data()
+    payment_mode = data.get("payment_mode", "card")
 
-    active_cards = await list_payment_cards(active_only=True)
-    if not active_cards:
+    if payment_mode == "money_balance":
+        price = int(data.get("total_price", data.get("price", 0)) or 0)
+        almaz_value = int(data.get("total_almaz", data.get("almaz", 0)) or 0)
+        user = await get_user(message.from_user.id)
+        if not user:
+            await state.clear()
+            await message.answer("Foydalanuvchi topilmadi.")
+            return
+
+        if int(user["money_balance"] or 0) < price:
+            await state.clear()
+            text = await build_balance_text(message.from_user.id, message.from_user.first_name)
+            if text:
+                await message.answer(text, reply_markup=promo_enter_keyboard())
+            return
+
+        spent = await spend_money_balance(message.from_user.id, price)
+        if not spent:
+            await state.clear()
+            await message.answer("❌ So'm balansdan yechib bo'lmadi. Qaytadan urinib ko'ring.")
+            return
+
+        now = utc_now()
+        order_id = await db.fetchval(
+            """
+            INSERT INTO orders (
+                user_id,
+                username,
+                first_name,
+                product_type,
+                product_name,
+                almaz,
+                quantity,
+                price,
+                ff_id,
+                check_photo_id,
+                payment_source,
+                status,
+                bonus_code_id,
+                bonus_owner_id,
+                bonus_percent_bp,
+                bonus_amount,
+                created_at,
+                updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, 'money_balance', $10, $11, $12, $13, $14, $15, $16)
+            RETURNING id
+            """,
+            message.from_user.id,
+            message.from_user.username,
+            message.from_user.first_name,
+            "voucher" if data.get("is_voucher") else "almaz",
+            data.get("name") or data.get("package_name"),
+            almaz_value,
+            data.get("quantity", 1),
+            price,
+            ff_id,
+            "pending",
+            data.get("bonus_code_id"),
+            data.get("bonus_owner_id"),
+            0,
+            0,
+            now,
+            now,
+        )
+
+        admin_text = (
+            '🧾 YANGI BUYURTMA\n\n'
+            f"🧾 Buyurtma raqami: #{order_id}\n"
+            f"👤 Foydalanuvchi: {message.from_user.full_name}\n"
+            f"🔗 Username: @{message.from_user.username if message.from_user.username else "yo'q"}\n"
+            f"🆔 User ID: {message.from_user.id}\n\n"
+            f"📦 Paket: {data.get('package_name') or data.get('name')}\n"
+            f"💎 Almaz: {almaz_value}\n"
+            f"💰 Narx: {price:,} so'm\n"
+            f"🎮 FF ID: {ff_id}\n"
+            "💳 To'lov turi: So'm balansdan yechildi\n\n"
+            '📌 Holat: ⏳ Kutilmoqda'
+        )
+
+        admins = await get_admins()
+        for admin_id, role in admins:
+            if role not in (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN):
+                continue
+            try:
+                sent = await message.bot.send_message(
+                    chat_id=admin_id,
+                    text=admin_text,
+                    reply_markup=admin_order_keyboard(message.from_user.id, almaz_value, order_id),
+                )
+                await save_admin_order_message(
+                    order_id=order_id,
+                    admin_id=admin_id,
+                    message_id=sent.message_id,
+                    caption=admin_text,
+                )
+            except Exception:
+                continue
+
+        await state.clear()
         await message.answer(
-            "❌ Hozircha to‘lov kartalari sozlanmagan.\n"
-            "Iltimos, keyinroq urinib ko‘ring.",
-            reply_markup=cancel_process_keyboard()
+            "✅ So'm balansdan to'lov qabul qilindi!\n\n"
+            f"🧾 Buyurtma raqami: #{order_id}\n"
+            '⏱️ Tez orada admin tekshiradi.'
         )
         return
 
-    cards_blocks = []
-    for c in active_cards:
-        title = (c.get("bank_name") or "Karta").strip()
-        number = (c.get("card_number") or "").strip()
-        holder = (c.get("holder_name") or "").strip()
-        block_lines = [number]
-        if holder:
-            block_lines.append(holder)
-        block = "<blockquote>" + "\n".join(block_lines) + "</blockquote>"
-        cards_blocks.append(f"{title}:\n{block}")
-
+    await state.set_state(OrderStates.waiting_payment)
+    active_cards = await list_payment_cards(active_only=True)
     await message.answer(
-        "💳 <b>TO‘LOV BOSQICHI</b>\n\n"
-        "🏦 <b>Karta raqamlari:</b>\n\n"
-        + "\n\n".join(cards_blocks)
-        + "\n\n"
-        "📌 <b>To‘lovni amalga oshiring</b> va\n"
-        "🧾 <b>chekni rasm qilib</b> shu yerga yuboring.\n\n"
-        "⚡ To‘lov tasdiqlangach, buyurtma tezkor ko‘rib chiqiladi.\n"
-        "🔒 Jarayon xavfsiz va qo‘lda tekshiriladi.",
+        build_payment_stage_text(active_cards),
         reply_markup=cancel_process_keyboard(),
-        parse_mode="HTML"
     )
 
 
@@ -1576,8 +2209,8 @@ async def ff_id_handler(message: Message, state: FSMContext):
 async def payment_handler(message: Message, state: FSMContext):
     if not message.photo:
         await message.answer(
-            "❌ Chek rasmini yuboring.\n"
-            "📌 Iltimos, faqat BITTA rasm yuboring."
+            '❌ Chek rasmini yuboring.\n'
+            '📌 Iltimos, faqat BITTA rasm yuboring.'
         )
         return
 
@@ -1585,21 +2218,21 @@ async def payment_handler(message: Message, state: FSMContext):
     user = message.from_user
     photo_id = message.photo[-1].file_id
 
-    # 🔹 BU YERDA INDENT TO‘G‘RI
+    # 🔹 BU YERDA INDENT TO'G'RI
     if data.get("is_voucher"):
         product_text = (
-            "💳 <b>VOUCHER MA’LUMOTI</b>\n\n"
+            "💳 <b>VOUCHER MA'LUMOTI</b>\n\n"
             f"🎫 Nomi: {data['name']}\n"
             f"🧮 Soni: {data['quantity']} dona\n"
             f"💎 Jami almaz: {data['total_almaz']}\n"
-            f"💰 Jami narx: {data['total_price']:,} so‘m\n"
+            f"💰 Jami narx: {data['total_price']:,} so'm\n"
         )
     else:
         product_text = (
-            "💎 <b>PAKET MA’LUMOTI</b>\n\n"
+            "💎 <b>PAKET MA'LUMOTI</b>\n\n"
             f"📦 Paket: {data.get('package_name') or data.get('name')}\n"
             f"💎 Almaz: {data.get('almaz')}\n"
-            f"💰 Narx: {data.get('price'):,} so‘m\n"
+            f"💰 Narx: {data.get('price'):,} so'm\n"
         )
 
 
@@ -1624,6 +2257,7 @@ async def payment_handler(message: Message, state: FSMContext):
             price,
             ff_id,
             check_photo_id,
+            payment_source,
             status,
             bonus_code_id,
             bonus_owner_id,
@@ -1631,7 +2265,7 @@ async def payment_handler(message: Message, state: FSMContext):
             bonus_amount,
             created_at,
             updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'card', $11, $12, $13, $14, $15, $16, $17)
         RETURNING id
         """,
         user.id,
@@ -1658,15 +2292,15 @@ async def payment_handler(message: Message, state: FSMContext):
         bonus_line = f"🎁 Bonus kod: <code>{data.get('bonus_code', '')}</code>\n"
 
     admin_text = (
-        "🧾 YANGI BUYURTMA\n\n"
+        '🧾 YANGI BUYURTMA\n\n'
         f"🧾 Buyurtma raqami: #{order_id}\n"
         f"👤 Foydalanuvchi: {user.full_name}\n"
-        f"🔗 Username: @{user.username if user.username else 'yo‘q'}\n"
+        f"🔗 Username: @{user.username if user.username else "yo'q"}\n"
         f"🆔 User ID: {user.id}\n\n"
         f"{product_text}"
         f"🎮 FF ID: {data.get('ff_id')}\n\n"
         f"{bonus_line}"
-        "📌 Holat: ⏳ Kutilmoqda"
+        '📌 Holat: ⏳ Kutilmoqda'
     )
     admins = await get_admins()
     for admin_id, role in admins:
@@ -1706,16 +2340,16 @@ async def payment_handler(message: Message, state: FSMContext):
     await state.clear()
 
     await message.answer(
-        "✅ To‘lov qabul qilindi!\n\n"
+        "✅ To'lov qabul qilindi!\n\n"
         f"🧾 Buyurtma raqami: #{order_id}\n"
-        "⏱️ Tez orada admin tekshiradi."
+        '⏱️ Tez orada admin tekshiradi.'
     )
 
 @router.callback_query(F.data.startswith("admin_confirm:"))
 async def admin_confirm_handler(callback: CallbackQuery):
     role = await get_admin_role(callback.from_user.id)
     if role not in (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN):
-        await callback.answer("⛔ Sizda ruxsat yo‘q", show_alert=True)
+        await callback.answer("⛔ Sizda ruxsat yo'q", show_alert=True)
         return
 
     try:
@@ -1724,7 +2358,7 @@ async def admin_confirm_handler(callback: CallbackQuery):
         user_id = int(user_id)
         almaz = int(almaz)
     except Exception:
-        await callback.answer("❌ Ma’lumot xato", show_alert=True)
+        await callback.answer("❌ Ma'lumot xato", show_alert=True)
         return
 
     order = await db.fetchrow(
@@ -1736,10 +2370,10 @@ async def admin_confirm_handler(callback: CallbackQuery):
         order_id,
     )
     if not order:
-        await callback.answer("❌ Buyurtma topilmadi", show_alert=True)
+        await callback.answer('❌ Buyurtma topilmadi', show_alert=True)
         return
     if order["status"] != "pending":
-        await callback.answer("⚠️ Buyurtma allaqachon ko‘rib chiqilgan", show_alert=True)
+        await callback.answer("⚠️ Buyurtma allaqachon ko'rib chiqilgan", show_alert=True)
         return
 
     order_almaz = order["almaz"] or almaz
@@ -1860,21 +2494,24 @@ async def admin_confirm_handler(callback: CallbackQuery):
 
     # 🧾 UPDATE ADMIN MESSAGE
     old_caption = callback.message.caption or ""
-    new_caption = update_order_status(old_caption, "✅ TASDIQLANDI")
+    new_caption = update_order_status(old_caption, '✅ TASDIQLANDI')
     new_caption = append_admin_info(
         new_caption,
         admin_display_name(callback.from_user),
         callback.from_user.id
     )
 
-    await callback.message.edit_caption(
-        caption=new_caption,
-        reply_markup=None
-    )
+    try:
+        await callback.message.edit_caption(
+            caption=new_caption,
+            reply_markup=None
+        )
+    except Exception:
+        await callback.message.edit_text(new_caption, reply_markup=None)
     await update_admin_order_messages(
         bot=callback.bot,
         order_id=order_id,
-        new_status_label="✅ TASDIQLANDI",
+        new_status_label='✅ TASDIQLANDI',
         acting_admin_name=admin_display_name(callback.from_user),
         acting_admin_id=callback.from_user.id,
     )
@@ -1882,15 +2519,15 @@ async def admin_confirm_handler(callback: CallbackQuery):
     # 📩 USER NOTIFY
     try:
         menu_kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🏠 Asosiy Menyu", callback_data="back_to_menu")]]
+            inline_keyboard=[[InlineKeyboardButton(text='🏠 Asosiy Menyu', callback_data="back_to_menu")]]
         )
         await callback.bot.send_message(
             chat_id=user_id,
             text=(
-                "🎉 <b>BUYURTMA TASDIQLANDI!</b>\n\n"
+                '🎉 <b>BUYURTMA TASDIQLANDI!</b>\n\n'
                 f"💎 Almaz: {order_almaz}\n"
                 f"🎁 Bonus: +{bonus_amount} 💎\n\n"
-                "🙏 Xaridingiz uchun rahmat!"
+                '🙏 Xaridingiz uchun rahmat!'
             ),
             reply_markup=menu_kb
         )
@@ -1907,14 +2544,14 @@ async def admin_confirm_handler(callback: CallbackQuery):
     if log_err:
         await callback.message.answer(f"⚠️ {log_err}")
 
-    await callback.answer("✅ Buyurtma tasdiqlandi")
+    await callback.answer('✅ Buyurtma tasdiqlandi')
 
 
 @router.callback_query(F.data.startswith("admin_fake:"))
 async def admin_fake_handler(callback: CallbackQuery):
     role = await get_admin_role(callback.from_user.id)
     if role not in (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN):
-        await callback.answer("⛔ Sizda ruxsat yo‘q", show_alert=True)
+        await callback.answer("⛔ Sizda ruxsat yo'q", show_alert=True)
         return
 
     _, order_id, user_id = callback.data.split(":")
@@ -1922,14 +2559,14 @@ async def admin_fake_handler(callback: CallbackQuery):
     user_id = int(user_id)
 
     order = await db.fetchrow(
-        "SELECT status FROM orders WHERE id = $1",
+        "SELECT status, payment_source, price FROM orders WHERE id = $1",
         order_id,
     )
     if not order:
-        await callback.answer("❌ Buyurtma topilmadi", show_alert=True)
+        await callback.answer('❌ Buyurtma topilmadi', show_alert=True)
         return
     if order["status"] != "pending":
-        await callback.answer("⚠️ Buyurtma allaqachon ko‘rib chiqilgan", show_alert=True)
+        await callback.answer("⚠️ Buyurtma allaqachon ko'rib chiqilgan", show_alert=True)
         return
 
     await db.execute(
@@ -1947,12 +2584,17 @@ async def admin_fake_handler(callback: CallbackQuery):
         utc_now(),
         order_id,
     )
+    if (order.get("payment_source") or "").lower() == "money_balance":
+        await add_money_balance(user_id, int(order.get("price") or 0))
 
     await log_admin_action(
         admin_id=callback.from_user.id,
         action="ORDER_REJECTED",
         order_id=order_id,
-        details="Soxta chek deb belgilandi"
+        details=(
+            "Soxta chek deb belgilandi"
+            + ("; pul qaytarildi" if (order.get("payment_source") or "").lower() == "money_balance" else "")
+        ),
     )
     await log_order_status_change(
         admin_id=callback.from_user.id,
@@ -1962,30 +2604,33 @@ async def admin_fake_handler(callback: CallbackQuery):
     )
 
     old_caption = callback.message.caption or ""
-    new_caption = update_order_status(old_caption, "❌ SOXTA CHEK")
+    new_caption = update_order_status(old_caption, '❌ SOXTA CHEK')
     new_caption = append_admin_info(
         new_caption,
         admin_display_name(callback.from_user),
         callback.from_user.id
     )
 
-    await callback.message.edit_caption(
-        caption=new_caption,
-        reply_markup=None
-    )
+    try:
+        await callback.message.edit_caption(
+            caption=new_caption,
+            reply_markup=None
+        )
+    except Exception:
+        await callback.message.edit_text(new_caption, reply_markup=None)
     await update_admin_order_messages(
         bot=callback.bot,
         order_id=order_id,
-        new_status_label="❌ SOXTA CHEK",
+        new_status_label='❌ SOXTA CHEK',
         acting_admin_name=admin_display_name(callback.from_user),
         acting_admin_id=callback.from_user.id,
     )
 
     await callback.bot.send_message(
         chat_id=user_id,
-        text="❌ To‘lov rad etildi.\n🧾 Chek soxta yoki noto‘g‘ri.",
+        text="❌ To'lov rad etildi.\n🧾 Chek soxta yoki noto'g'ri.",
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🏠 Asosiy Menyu", callback_data="back_to_menu")]]
+            inline_keyboard=[[InlineKeyboardButton(text='🏠 Asosiy Menyu', callback_data="back_to_menu")]]
         )
     )
 
@@ -1994,11 +2639,308 @@ async def admin_fake_handler(callback: CallbackQuery):
     await callback.answer("Soxta chek")
 
 
+@router.callback_query(F.data.startswith("admin_cancel:"))
+async def admin_cancel_handler(callback: CallbackQuery):
+    role = await get_admin_role(callback.from_user.id)
+    if role not in (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN):
+        await callback.answer("⛔ Sizda ruxsat yo'q", show_alert=True)
+        return
+
+    _, order_id, user_id = callback.data.split(":")
+    order_id = int(order_id)
+    user_id = int(user_id)
+
+    order = await db.fetchrow(
+        "SELECT status, payment_source, price FROM orders WHERE id = $1",
+        order_id,
+    )
+    if not order:
+        await callback.answer('❌ Buyurtma topilmadi', show_alert=True)
+        return
+    if order["status"] != "pending":
+        await callback.answer("⚠️ Buyurtma allaqachon ko'rib chiqilgan", show_alert=True)
+        return
+
+    await db.execute(
+        """
+        UPDATE orders
+        SET status = $1,
+            admin_id = $2,
+            updated_at = $3,
+            rejected_at = $4
+        WHERE id = $5
+        """,
+        "rejected",
+        callback.from_user.id,
+        utc_now(),
+        utc_now(),
+        order_id,
+    )
+    if (order.get("payment_source") or "").lower() == "money_balance":
+        await add_money_balance(user_id, int(order.get("price") or 0))
+
+    await log_admin_action(
+        admin_id=callback.from_user.id,
+        action="ORDER_REJECTED",
+        order_id=order_id,
+        details=(
+            "Admin tomonidan bekor qilindi"
+            + ("; pul qaytarildi" if (order.get("payment_source") or "").lower() == "money_balance" else "")
+        ),
+    )
+    await log_order_status_change(
+        admin_id=callback.from_user.id,
+        order_id=order_id,
+        old_status="pending",
+        new_status="rejected",
+    )
+
+    old_caption = callback.message.caption or ""
+    new_caption = update_order_status(old_caption, '❌ BEKOR QILINDI')
+    new_caption = append_admin_info(
+        new_caption,
+        admin_display_name(callback.from_user),
+        callback.from_user.id,
+    )
+
+    try:
+        await callback.message.edit_caption(
+            caption=new_caption,
+            reply_markup=None
+        )
+    except Exception:
+        await callback.message.edit_text(new_caption, reply_markup=None)
+    await update_admin_order_messages(
+        bot=callback.bot,
+        order_id=order_id,
+        new_status_label='❌ BEKOR QILINDI',
+        acting_admin_name=admin_display_name(callback.from_user),
+        acting_admin_id=callback.from_user.id,
+    )
+
+    await callback.bot.send_message(
+        chat_id=user_id,
+        text='❌ Buyurtmangiz admin tomonidan bekor qilindi.',
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text='🏠 Asosiy Menyu', callback_data="back_to_menu")]]
+        )
+    )
+
+    await callback.answer("Bekor qilindi")
+
+
+@router.callback_query(F.data.startswith("topup_confirm:"))
+async def topup_confirm_start(callback: CallbackQuery, state: FSMContext):
+    role = await get_admin_role(callback.from_user.id)
+    if role not in (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN):
+        await callback.answer("⛔ Sizda ruxsat yo'q", show_alert=True)
+        return
+
+    try:
+        _, request_id, user_id = callback.data.split(":")
+        request_id = int(request_id)
+        user_id = int(user_id)
+    except Exception:
+        await callback.answer("❌ Ma'lumot xato", show_alert=True)
+        return
+
+    req = await get_balance_topup_request(request_id)
+    if not req:
+        await callback.answer("❌ So'rov topilmadi", show_alert=True)
+        return
+    if req["status"] != "pending":
+        await callback.answer("⚠️ So'rov allaqachon ko'rib chiqilgan", show_alert=True)
+        return
+
+    await state.set_state(AdminBalanceTopupStates.waiting_amount)
+    await state.update_data(
+        topup_request_id=request_id,
+        topup_user_id=user_id,
+        topup_admin_chat_id=callback.message.chat.id if callback.message else None,
+        topup_admin_message_id=callback.message.message_id if callback.message else None,
+    )
+    await callback.message.answer(
+        f"💰 So'rov #{request_id} uchun to'ldiriladigan so'm summasini yuboring:"
+    )
+    await callback.answer()
+
+
+@router.message(AdminBalanceTopupStates.waiting_amount)
+async def topup_confirm_amount_handler(message: Message, state: FSMContext):
+    role = await get_admin_role(message.from_user.id)
+    if role not in (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN):
+        await state.clear()
+        return
+
+    amount = parse_admin_int_input(message.text or "")
+    if amount is None or amount <= 0:
+        await message.answer('❌ Faqat musbat summa kiriting. Masalan: 50000')
+        return
+
+    data = await state.get_data()
+    request_id = int(data.get("topup_request_id") or 0)
+    user_id = int(data.get("topup_user_id") or 0)
+    admin_chat_id = data.get("topup_admin_chat_id")
+    admin_message_id = data.get("topup_admin_message_id")
+    if not request_id or not user_id:
+        await state.clear()
+        await message.answer("❌ So'rov ma'lumoti topilmadi.")
+        return
+
+    req = await get_balance_topup_request(request_id)
+    if not req or req["status"] != "pending":
+        await state.clear()
+        await message.answer("⚠️ So'rov allaqachon ko'rib chiqilgan.")
+        return
+
+    await add_money_balance(user_id, amount)
+    await update_balance_topup_request(
+        request_id=request_id,
+        status="approved",
+        admin_id=message.from_user.id,
+        amount=amount,
+    )
+
+    if admin_chat_id and admin_message_id:
+        try:
+            caption = (
+                "💰 SO'M BALANS TO'LDIRISH SO'ROVI\n\n"
+                f"🧾 So'rov raqami: #{request_id}\n"
+                f"👤 Foydalanuvchi: {req['first_name'] or '-'}\n"
+                f"🔗 Username: @{req['username'] if req['username'] else "yo'q"}\n"
+                f"🆔 User ID: {user_id}\n\n"
+                f"📌 Holat: ✅ TASDIQLANDI\n"
+                f"💰 To'ldirildi: {amount:,} so'm\n"
+                f"👮 Admin: {admin_display_name(message.from_user)} ({message.from_user.id})"
+            )
+            await message.bot.edit_message_caption(
+                chat_id=admin_chat_id,
+                message_id=admin_message_id,
+                caption=caption,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
+    try:
+        await message.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "✅ So'm balansingiz to'ldirildi.\n"
+                f"💰 +{amount:,} so'm qo'shildi."
+            ),
+        )
+    except Exception:
+        pass
+
+    await log_admin_action(
+        admin_id=message.from_user.id,
+        action="BALANCE_TOPUP_APPROVED",
+        details=f"request_id:{request_id} user_id:{user_id} amount:{amount}",
+    )
+    await state.clear()
+    await message.answer("✅ So'm balans muvaffaqiyatli to'ldirildi.")
+
+
+@router.callback_query(F.data.startswith("topup_cancel:"))
+async def topup_cancel_handler(callback: CallbackQuery):
+    role = await get_admin_role(callback.from_user.id)
+    if role not in (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN):
+        await callback.answer("⛔ Sizda ruxsat yo'q", show_alert=True)
+        return
+
+    try:
+        _, request_id, user_id = callback.data.split(":")
+        request_id = int(request_id)
+        user_id = int(user_id)
+    except Exception:
+        await callback.answer("❌ Ma'lumot xato", show_alert=True)
+        return
+
+    req = await get_balance_topup_request(request_id)
+    if not req:
+        await callback.answer("❌ So'rov topilmadi", show_alert=True)
+        return
+    if req["status"] != "pending":
+        await callback.answer("⚠️ So'rov allaqachon ko'rib chiqilgan", show_alert=True)
+        return
+
+    await update_balance_topup_request(
+        request_id=request_id,
+        status="rejected",
+        admin_id=callback.from_user.id,
+        amount=0,
+    )
+    try:
+        old_caption = callback.message.caption or ""
+        new_caption = old_caption + f"\n\n📌 Holat: ❌ BEKOR QILINDI\n👮 Admin: {admin_display_name(callback.from_user)} ({callback.from_user.id})"
+        await callback.message.edit_caption(caption=new_caption, reply_markup=None)
+    except Exception:
+        pass
+    try:
+        await callback.bot.send_message(user_id, "❌ So'm balans to'ldirish so'rovingiz bekor qilindi.")
+    except Exception:
+        pass
+    await log_admin_action(
+        admin_id=callback.from_user.id,
+        action="BALANCE_TOPUP_REJECTED",
+        details=f"request_id:{request_id} user_id:{user_id} reason:cancel",
+    )
+    await callback.answer("So'rov bekor qilindi")
+
+
+@router.callback_query(F.data.startswith("topup_fake:"))
+async def topup_fake_handler(callback: CallbackQuery):
+    role = await get_admin_role(callback.from_user.id)
+    if role not in (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN):
+        await callback.answer("⛔ Sizda ruxsat yo'q", show_alert=True)
+        return
+
+    try:
+        _, request_id, user_id = callback.data.split(":")
+        request_id = int(request_id)
+        user_id = int(user_id)
+    except Exception:
+        await callback.answer("❌ Ma'lumot xato", show_alert=True)
+        return
+
+    req = await get_balance_topup_request(request_id)
+    if not req:
+        await callback.answer("❌ So'rov topilmadi", show_alert=True)
+        return
+    if req["status"] != "pending":
+        await callback.answer("⚠️ So'rov allaqachon ko'rib chiqilgan", show_alert=True)
+        return
+
+    await update_balance_topup_request(
+        request_id=request_id,
+        status="fake",
+        admin_id=callback.from_user.id,
+        amount=0,
+    )
+    try:
+        old_caption = callback.message.caption or ""
+        new_caption = old_caption + f"\n\n📌 Holat: ❌ SOXTA CHEK\n👮 Admin: {admin_display_name(callback.from_user)} ({callback.from_user.id})"
+        await callback.message.edit_caption(caption=new_caption, reply_markup=None)
+    except Exception:
+        pass
+    try:
+        await callback.bot.send_message(user_id, "❌ Chek soxta deb topildi. So'm balans to'ldirilmadi.")
+    except Exception:
+        pass
+    await log_admin_action(
+        admin_id=callback.from_user.id,
+        action="BALANCE_TOPUP_REJECTED",
+        details=f"request_id:{request_id} user_id:{user_id} reason:fake_check",
+    )
+    await callback.answer("Soxta chek")
+
+
 @router.callback_query(F.data.startswith("admin_edit:"))
 async def admin_edit_handler(callback: CallbackQuery, state: FSMContext):
     role = await get_admin_role(callback.from_user.id)
     if role not in (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN):
-        await callback.answer("⛔ Sizda ruxsat yo‘q", show_alert=True)
+        await callback.answer("⛔ Sizda ruxsat yo'q", show_alert=True)
         return
 
     try:
@@ -2006,7 +2948,7 @@ async def admin_edit_handler(callback: CallbackQuery, state: FSMContext):
         order_id = int(order_id)
         user_id = int(user_id)
     except Exception:
-        await callback.answer("❌ Ma’lumot xato", show_alert=True)
+        await callback.answer("❌ Ma'lumot xato", show_alert=True)
         return
 
     order = await db.fetchrow(
@@ -2014,10 +2956,10 @@ async def admin_edit_handler(callback: CallbackQuery, state: FSMContext):
         order_id,
     )
     if not order:
-        await callback.answer("❌ Buyurtma topilmadi", show_alert=True)
+        await callback.answer('❌ Buyurtma topilmadi', show_alert=True)
         return
     if order["status"] != "pending":
-        await callback.answer("⚠️ Buyurtma allaqachon ko‘rib chiqilgan", show_alert=True)
+        await callback.answer("⚠️ Buyurtma allaqachon ko'rib chiqilgan", show_alert=True)
         return
 
     await db.execute(
@@ -2047,21 +2989,24 @@ async def admin_edit_handler(callback: CallbackQuery, state: FSMContext):
     )
 
     old_caption = callback.message.caption or ""
-    new_caption = update_order_status(old_caption, "✍️ ADMIN TAHRIRI")
+    new_caption = update_order_status(old_caption, '✍️ ADMIN TAHRIRI')
     new_caption = append_admin_info(
         new_caption,
         admin_display_name(callback.from_user),
         callback.from_user.id
     )
 
-    await callback.message.edit_caption(
-        caption=new_caption,
-        reply_markup=None
-    )
+    try:
+        await callback.message.edit_caption(
+            caption=new_caption,
+            reply_markup=None
+        )
+    except Exception:
+        await callback.message.edit_text(new_caption, reply_markup=None)
     await update_admin_order_messages(
         bot=callback.bot,
         order_id=order_id,
-        new_status_label="✍️ ADMIN TAHRIRI",
+        new_status_label='✍️ ADMIN TAHRIRI',
         acting_admin_name=admin_display_name(callback.from_user),
         acting_admin_id=callback.from_user.id,
     )
@@ -2072,7 +3017,7 @@ async def admin_edit_handler(callback: CallbackQuery, state: FSMContext):
     await state.update_data(target_user_id=user_id, target_order_id=order_id)
 
     await callback.message.answer(
-        "✍️ Qaysi maydonni tahrirlaysiz?",
+        '✍️ Qaysi maydonni tahrirlaysiz?',
         reply_markup=admin_order_edit_keyboard(order_id, user_id),
     )
     await callback.answer("Tahrirlash")
@@ -2088,7 +3033,7 @@ async def admin_custom_message_handler(message: Message, state: FSMContext):
         chat_id=user_id,
         text=message.text,
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🏠 Asosiy Menyu", callback_data="back_to_menu")]]
+            inline_keyboard=[[InlineKeyboardButton(text='🏠 Asosiy Menyu', callback_data="back_to_menu")]]
         )
     )
 
@@ -2100,14 +3045,14 @@ async def admin_custom_message_handler(message: Message, state: FSMContext):
     )
 
     await state.clear()
-    await message.answer("✅ Xabar foydalanuvchiga yuborildi")
+    await message.answer('✅ Xabar foydalanuvchiga yuborildi')
 
 
 @router.callback_query(F.data.startswith("admin_edit_field:"))
 async def admin_edit_field_handler(callback: CallbackQuery, state: FSMContext):
     role = await get_admin_role(callback.from_user.id)
     if role not in (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN):
-        await callback.answer("⛔ Sizda ruxsat yo‘q", show_alert=True)
+        await callback.answer("⛔ Sizda ruxsat yo'q", show_alert=True)
         return
 
     try:
@@ -2115,7 +3060,7 @@ async def admin_edit_field_handler(callback: CallbackQuery, state: FSMContext):
         order_id = int(order_id)
         user_id = int(user_id)
     except Exception:
-        await callback.answer("❌ Ma’lumot xato", show_alert=True)
+        await callback.answer("❌ Ma'lumot xato", show_alert=True)
         return
 
     await state.set_state(AdminOrderEditStates.edit_value)
@@ -2150,7 +3095,7 @@ async def admin_edit_value_handler(message: Message, state: FSMContext):
 
     if not order_id or not field:
         await state.clear()
-        await message.answer("❌ Holat xato, qayta urinib ko‘ring.")
+        await message.answer("❌ Holat xato, qayta urinib ko'ring.")
         return
 
     order = await db.fetchrow(
@@ -2159,18 +3104,18 @@ async def admin_edit_value_handler(message: Message, state: FSMContext):
     )
     if not order:
         await state.clear()
-        await message.answer("❌ Buyurtma topilmadi.")
+        await message.answer('❌ Buyurtma topilmadi.')
         return
 
     new_value_raw = (message.text or "").strip()
     if field in ("almaz", "price"):
         if not new_value_raw.isdigit():
-            await message.answer("❌ Faqat raqam kiriting.")
+            await message.answer('❌ Faqat raqam kiriting.')
             return
         new_value = int(new_value_raw)
     else:
         if not new_value_raw:
-            await message.answer("❌ Bo‘sh qiymat bo‘lmaydi.")
+            await message.answer("❌ Bo'sh qiymat bo'lmaydi.")
             return
         new_value = new_value_raw
 
@@ -2183,7 +3128,7 @@ async def admin_edit_value_handler(message: Message, state: FSMContext):
     column = column_map.get(field)
     if not column:
         await state.clear()
-        await message.answer("❌ Noto‘g‘ri maydon.")
+        await message.answer("❌ Noto'g'ri maydon.")
         return
 
     await db.execute(
@@ -2218,47 +3163,47 @@ async def admin_edit_value_handler(message: Message, state: FSMContext):
 
     await state.set_state(AdminOrderEditStates.select_field)
     await message.answer(
-        "✅ Saqlandi. Yana qaysi maydonni tahrirlaysiz?",
+        '✅ Saqlandi. Yana qaysi maydonni tahrirlaysiz?',
         reply_markup=admin_order_edit_keyboard(order_id, user_id),
     )
 
 
 @router.message(Command("admin"))
 async def admin_panel_handler(message: Message, state: FSMContext):
-    role = await get_admin_role(message.from_user.id)
-    if not role:
-        await message.answer(
-            "⛔ Sizda ruxsat yo‘q",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="🏠 Asosiy Menyu", callback_data="back_to_menu")]]
-            )
-        )
-        return
-
-    await state.set_state(AdminMenuStates.menu)
-    await state.update_data(**{ADMIN_NAV_STACK_KEY: []})
-    await push_nav(state, "admin_menu")
-    await show_admin_menu(message, state)
-
+    await _open_admin_panel(message, state)
 
 @router.message(Command("help"))
 async def help_handler(message: Message):
     text = (
-        "❓ <b>Yordam / FAQ</b>\n\n"
-        "• Almaz yoki voucher sotib olish uchun menyudan kerakli bo‘limni tanlang.\n"
-        "• To‘lovdan keyin chek rasmini yuboring.\n"
-        "• Buyurtma tez orada adminlar tomonidan ko‘rib chiqiladi.\n"
-        "• Savollar bo‘lsa, admin bilan bog‘lanish bo‘limidan foydalaning.\n\n"
-        "⬇️ Asosiy menyuga qaytish uchun quyidagi tugmani bosing."
+        '🆘 <b>Yordam markazi</b>\n\n'
+
+        "Bot orqali Free Fire uchun almaz yoki voucherlarni "
+        "tez va qulay tarzda xarid qilishingiz mumkin.\n\n"
+
+        '📌 <b>Qanday ishlaydi?</b>\n'
+        "1️⃣ Menyudan kerakli bo'limni tanlang\n"
+        '2️⃣ Kerakli paket yoki voucher tanlang\n'
+        '3️⃣ Free Fire ID raqamingizni kiriting\n'
+        "4️⃣ To'lovni amalga oshirib chek yuboring\n\n"
+
+        '⚡ Buyurtmalar odatda <b>5–15 daqiqa</b> ichida '
+        "adminlar tomonidan tekshiriladi.\n\n"
+
+        "❗ Agar savollaringiz bo'lsa "
+        "<b>📞 Yordam / Admin</b> bo'limi orqali murojaat qilishingiz mumkin.\n\n"
+
+        '⬇️ Asosiy menyuga qaytish uchun quyidagi tugmadan foydalaning.'
     )
+
+
     await message.answer(
         text,
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🏠 Asosiy Menyu", callback_data="back_to_menu")]]
+            inline_keyboard=[[InlineKeyboardButton(text='🏠 Asosiy Menyu', callback_data="back_to_menu")]]
         )
     )
 
-@router.message(AdminMenuStates.menu, F.text == "👥 Foydalanuvchilar soni")
+@router.message(AdminMenuStates.menu, F.text == '👥 Foydalanuvchilar soni')
 async def users_stats_menu_handler(message: Message):
     role = await require_role(message, (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN, ADMIN_ROLE_VIEWER))
     if not role:
@@ -2287,7 +3232,7 @@ async def users_stats_menu_handler(message: Message):
     )
 
     await message.answer(
-        "📊 FOYDALANUVCHILAR STATISTIKASI\n\n"
+        '📊 FOYDALANUVCHILAR STATISTIKASI\n\n'
         f"👥 Umumiy: {total}\n"
         f"📅 Bugun: {today_count}\n"
         f"🗓 7 kun: {week_count}\n"
@@ -2347,6 +3292,9 @@ async def admin_menu_fallback_router(message: Message, state: FSMContext):
     if "asosiy menyu text" in norm:
         await admin_edit_main_menu_text(message, state)
         return
+    if "bo'limga yuklash" in norm or "bolimga yuklash" in norm:
+        await admin_content_button_start(message, state)
+        return
     if "reklama" in norm or "xabar" in norm:
         await admin_broadcast_menu(message, state)
         return
@@ -2363,13 +3311,304 @@ async def admin_menu_fallback_router(message: Message, state: FSMContext):
         await admin_stats_menu(message, state)
         return
 
-@router.message(AdminMenuStates.menu, F.text == "⬅️ Orqaga")
+@router.message(AdminMenuStates.menu, F.text == '⬅️ Orqaga')
 async def admin_back_handler(message: Message, state: FSMContext):
     await state.clear()
     await show_main_menu_message(message)
 
 
-@router.message(AdminMenuStates.menu, F.text == "🖼 Asosiy menyu rasmi")
+@router.message(AdminMenuStates.menu, F.text == "📥 Bo'limga yuklash")
+async def admin_content_button_start(message: Message, state: FSMContext):
+    role = await require_role(message, (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN))
+    if not role:
+        return
+
+    await state.set_state(AdminContentButtonStates.menu)
+    await message.answer(
+        "📥 <b>Bo'limga yuklash (CRUD)</b>\n\nKerakli amalni tanlang:",
+        reply_markup=admin_content_buttons_menu_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminContentButtonStates.menu)
+async def admin_content_button_menu_fallback(message: Message, state: FSMContext):
+    role = await require_role(message, (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN))
+    if not role:
+        return
+
+    raw = message.text or ""
+    norm = normalize_menu_text(raw)
+    norm_no_quote = norm.replace("'", " ")
+
+    if not norm:
+        return
+    if "orqaga" in norm:
+        await state.set_state(AdminMenuStates.menu)
+        await message.answer("🛠 ADMIN PANEL", reply_markup=admin_menu_keyboard(role))
+        return
+    if "yangi" in norm and ("qosh" in norm_no_quote or "qo'sh" in norm):
+        await state.set_state(AdminContentButtonStates.add_label)
+        await message.answer(
+            "Yangi bo'lim nomini yuboring.\n\n"
+            "Masalan: <code>Dokumentlar</code> yoki <code>Telegram Android</code>.\n"
+            "Bekor qilish: ⬅️ Orqaga",
+            reply_markup=back_only_keyboard(),
+            parse_mode="HTML",
+        )
+        return
+    if "royxat" in norm_no_quote or "ro'yxat" in norm:
+        rows = await list_content_buttons()
+        if not rows:
+            await message.answer("Hozircha bo'limlar yo'q.", reply_markup=admin_content_buttons_menu_keyboard())
+            return
+        lines = ["📋 <b>Saqlangan bo'limlar</b>"]
+        for row in rows:
+            lines.append(f"• <b>{row['label']}</b> — {row['content_type']} (ID: {row['id']})")
+        await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=admin_content_buttons_menu_keyboard())
+        return
+    if "tahrir" in norm:
+        rows = await list_content_buttons()
+        if not rows:
+            await message.answer("Tahrirlash uchun bo'lim topilmadi.", reply_markup=admin_content_buttons_menu_keyboard())
+            return
+        await state.set_state(AdminContentButtonStates.edit_select)
+        await message.answer(
+            "Qaysi bo'limni tahrirlaysiz? Bo'lim nomini yuboring.\n"
+            "Bekor qilish: ⬅️ Orqaga",
+            reply_markup=back_only_keyboard(),
+        )
+        return
+    if "ochir" in norm_no_quote or "o'chir" in norm:
+        rows = await list_content_buttons()
+        if not rows:
+            await message.answer("O'chirish uchun bo'lim topilmadi.", reply_markup=admin_content_buttons_menu_keyboard())
+            return
+        await state.set_state(AdminContentButtonStates.delete_select)
+        await message.answer(
+            "O'chiriladigan bo'lim nomini yuboring.\n"
+            "Bekor qilish: ⬅️ Orqaga",
+            reply_markup=back_only_keyboard(),
+        )
+        return
+
+
+@router.message(AdminContentButtonStates.add_label)
+async def admin_content_button_save_label(message: Message, state: FSMContext):
+    role = await require_role(message, (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN))
+    if not role:
+        return
+
+    raw = (message.text or "").strip()
+    if raw in {"⬅️ Orqaga", "Orqaga"}:
+        await state.set_state(AdminContentButtonStates.menu)
+        await message.answer("📥 Bo'lim CRUD menyusi", reply_markup=admin_content_buttons_menu_keyboard())
+        return
+
+    if not raw:
+        await message.answer("Bo'lim nomini matn ko'rinishida yuboring.")
+        return
+    if len(raw) > 64:
+        await message.answer("Bo'lim nomi 64 ta belgidan oshmasin.")
+        return
+
+    await state.update_data(content_button_label=raw)
+    await state.set_state(AdminContentButtonStates.add_content)
+    await message.answer(
+        "Endi shu bo'lim uchun kontent yuboring (text yoki media).\n"
+        "Bekor qilish: ?? Orqaga",
+        reply_markup=back_only_keyboard(),
+    )
+
+
+@router.message(AdminContentButtonStates.add_content)
+async def admin_content_button_save_content(message: Message, state: FSMContext):
+    role = await require_role(message, (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN))
+    if not role:
+        return
+
+    if (message.text or "").strip() in {"⬅️ Orqaga", "Orqaga"}:
+        await state.set_state(AdminContentButtonStates.menu)
+        await message.answer("📥 Bo'lim CRUD menyusi", reply_markup=admin_content_buttons_menu_keyboard())
+        return
+
+    content_type = detect_broadcast_type(message)
+    if content_type not in CONTENT_BUTTON_SUPPORTED_TYPES:
+        await message.answer("Bu turdagi kontent qo'llanmaydi. Text yoki media yuboring.")
+        return
+
+    data = await state.get_data()
+    label = (data.get("content_button_label") or "").strip()
+    if not label:
+        await state.set_state(AdminContentButtonStates.menu)
+        await message.answer("Xatolik: bo'lim nomi topilmadi.", reply_markup=admin_content_buttons_menu_keyboard())
+        return
+
+    existing = await get_content_button_by_label(label)
+    now = utc_now()
+    await db.execute(
+        """
+        INSERT INTO content_buttons (
+            label,
+            source_chat_id,
+            source_message_id,
+            content_type,
+            admin_id,
+            created_at,
+            updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $6)
+        ON CONFLICT (label) DO UPDATE SET
+            source_chat_id = EXCLUDED.source_chat_id,
+            source_message_id = EXCLUDED.source_message_id,
+            content_type = EXCLUDED.content_type,
+            admin_id = EXCLUDED.admin_id,
+            updated_at = EXCLUDED.updated_at
+        """,
+        label,
+        message.chat.id,
+        message.message_id,
+        content_type,
+        message.from_user.id,
+        now,
+    )
+
+    await log_admin_action(
+        admin_id=message.from_user.id,
+        action="CONTENT_BUTTON_SAVED",
+        details=f"label={label};type={content_type};mode={'update' if existing else 'create'}",
+    )
+
+    await state.set_state(AdminContentButtonStates.menu)
+    await message.answer(
+        f"? <b>{label}</b> bo'limi saqlandi.",
+        reply_markup=admin_content_buttons_menu_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+@router.message(AdminContentButtonStates.edit_select)
+async def admin_content_button_edit_pick(message: Message, state: FSMContext):
+    role = await require_role(message, (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN))
+    if not role:
+        return
+
+    raw = (message.text or "").strip()
+    if raw in {"⬅️ Orqaga", "Orqaga"}:
+        await state.set_state(AdminContentButtonStates.menu)
+        await message.answer("📥 Bo'lim CRUD menyusi", reply_markup=admin_content_buttons_menu_keyboard())
+        return
+
+    row = await find_content_button_by_label(raw)
+    if not row:
+        await message.answer("Bunday bo'lim topilmadi. Nomini aniq yuboring.")
+        return
+
+    await state.update_data(content_button_edit_label=row["label"])
+    await state.set_state(AdminContentButtonStates.edit_content)
+    await message.answer(
+        f"<b>{row['label']}</b> bo'limi uchun yangi kontent yuboring.\n"
+        "Bekor qilish: ?? Orqaga",
+        parse_mode="HTML",
+        reply_markup=back_only_keyboard(),
+    )
+
+
+@router.message(AdminContentButtonStates.edit_content)
+async def admin_content_button_edit_content(message: Message, state: FSMContext):
+    role = await require_role(message, (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN))
+    if not role:
+        return
+
+    if (message.text or "").strip() in {"⬅️ Orqaga", "Orqaga"}:
+        await state.set_state(AdminContentButtonStates.menu)
+        await message.answer("📥 Bo'lim CRUD menyusi", reply_markup=admin_content_buttons_menu_keyboard())
+        return
+
+    content_type = detect_broadcast_type(message)
+    if content_type not in CONTENT_BUTTON_SUPPORTED_TYPES:
+        await message.answer("Bu turdagi kontent qo'llanmaydi. Text yoki media yuboring.")
+        return
+
+    data = await state.get_data()
+    label = (data.get("content_button_edit_label") or "").strip()
+    if not label:
+        await state.set_state(AdminContentButtonStates.menu)
+        await message.answer("Xatolik: tahrirlanadigan bo'lim topilmadi.", reply_markup=admin_content_buttons_menu_keyboard())
+        return
+
+    result = await db.execute(
+        """
+        UPDATE content_buttons
+        SET source_chat_id = $1,
+            source_message_id = $2,
+            content_type = $3,
+            admin_id = $4,
+            updated_at = $5
+        WHERE label = $6
+        """,
+        message.chat.id,
+        message.message_id,
+        content_type,
+        message.from_user.id,
+        utc_now(),
+        label,
+    )
+    if not str(result).endswith("1"):
+        await message.answer("Bo'lim yangilanmadi. Qaytadan urinib ko'ring.")
+        return
+
+    await log_admin_action(
+        admin_id=message.from_user.id,
+        action="CONTENT_BUTTON_UPDATED",
+        details=f"label={label};type={content_type}",
+    )
+
+    await state.set_state(AdminContentButtonStates.menu)
+    await message.answer(
+        f"? <b>{label}</b> bo'limi yangilandi.",
+        parse_mode="HTML",
+        reply_markup=admin_content_buttons_menu_keyboard(),
+    )
+
+
+@router.message(AdminContentButtonStates.delete_select)
+async def admin_content_button_delete_confirm(message: Message, state: FSMContext):
+    role = await require_role(message, (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN))
+    if not role:
+        return
+
+    raw = (message.text or "").strip()
+    if raw in {"⬅️ Orqaga", "Orqaga"}:
+        await state.set_state(AdminContentButtonStates.menu)
+        await message.answer("📥 Bo'lim CRUD menyusi", reply_markup=admin_content_buttons_menu_keyboard())
+        return
+
+    row = await find_content_button_by_label(raw)
+    if not row:
+        await message.answer("Bunday bo'lim topilmadi. Nomini aniq yuboring.")
+        return
+
+    result = await db.execute("DELETE FROM content_buttons WHERE id = $1", row["id"])
+    if not str(result).endswith("1"):
+        await message.answer("Bo'limni o'chirib bo'lmadi. Qaytadan urinib ko'ring.")
+        return
+
+    await log_admin_action(
+        admin_id=message.from_user.id,
+        action="CONTENT_BUTTON_DELETED",
+        details=f"label={row['label']};id={row['id']}",
+    )
+
+    await state.set_state(AdminContentButtonStates.menu)
+    await message.answer(
+        f"? <b>{row['label']}</b> bo'limi o'chirildi.",
+        parse_mode="HTML",
+        reply_markup=admin_content_buttons_menu_keyboard(),
+    )
+
+
+@router.message(AdminMenuStates.menu, F.text == '🖼 Asosiy menyu rasmi')
 async def admin_main_menu_photo_start(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
@@ -2377,9 +3616,9 @@ async def admin_main_menu_photo_start(message: Message, state: FSMContext):
 
     await state.set_state(AdminMainMenuPhotoStates.waiting_photo)
     await message.answer(
-        "🖼 Asosiy menyu uchun RASM yuboring.\n\n"
-        "O‘chirish uchun: 0 yuboring.\n"
-        "Orqaga qaytish uchun: ⬅️ Orqaga"
+        '🖼 Asosiy menyu uchun RASM yuboring.\n\n'
+        "O'chirish uchun: 0 yuboring.\n"
+        'Orqaga qaytish uchun: ⬅️ Orqaga'
     )
 
 
@@ -2389,7 +3628,7 @@ async def admin_main_menu_photo_save(message: Message, state: FSMContext):
     if not role:
         return
 
-    if message.text and message.text.strip() == "⬅️ Orqaga":
+    if message.text and message.text.strip() == '⬅️ Orqaga':
         await state.set_state(AdminMenuStates.menu)
         await message.answer(
             "🛠 ADMIN PANEL",
@@ -2401,13 +3640,13 @@ async def admin_main_menu_photo_save(message: Message, state: FSMContext):
         await set_setting("main_menu_photo_id", "")
         await state.set_state(AdminMenuStates.menu)
         await message.answer(
-            "✅ Asosiy menyu rasmi o‘chirildi",
+            "✅ Asosiy menyu rasmi o'chirildi",
             reply_markup=admin_menu_keyboard(role),
         )
         return
 
     if not message.photo:
-        await message.answer("❌ Iltimos, rasm yuboring yoki 0 yozing")
+        await message.answer('❌ Iltimos, rasm yuboring yoki 0 yozing')
         return
 
     photo_id = message.photo[-1].file_id
@@ -2415,12 +3654,12 @@ async def admin_main_menu_photo_save(message: Message, state: FSMContext):
 
     await state.set_state(AdminMenuStates.menu)
     await message.answer(
-        "✅ Asosiy menyu rasmi saqlandi",
+        '✅ Asosiy menyu rasmi saqlandi',
         reply_markup=admin_menu_keyboard(role),
     )
 
 
-@router.message(AdminMenuStates.menu, F.text == "📣 Reklama / Xabar")
+@router.message(AdminMenuStates.menu, F.text == '📣 Reklama / Xabar')
 async def admin_broadcast_menu(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN))
     if not role:
@@ -2428,7 +3667,7 @@ async def admin_broadcast_menu(message: Message, state: FSMContext):
 
     await state.set_state(AdminBroadcastStates.waiting_message)
     await message.answer(
-        "📣 Reklama rejimi yoqildi.\nEndi xabar yuboring.\nChiqish: ⬅️ Orqaga",
+        '📣 Reklama rejimi yoqildi.\nEndi xabar yuboring.\nChiqish: ⬅️ Orqaga',
         reply_markup=back_only_keyboard(),
     )
 
@@ -2519,7 +3758,7 @@ async def admin_broadcast_waiting_message(message: Message, state: FSMContext):
     if not role:
         return
 
-    if (message.text or "").strip() == "⬅️ Orqaga":
+    if (message.text or "").strip() == '⬅️ Orqaga':
         await state.set_state(AdminMenuStates.menu)
         await message.answer("🛠 ADMIN PANEL", reply_markup=admin_menu_keyboard(role))
         return
@@ -2553,7 +3792,7 @@ async def admin_broadcast_waiting_message(message: Message, state: FSMContext):
     )
 
 
-@router.message(AdminMenuStates.menu, F.text == "👮‍♂️ Adminlar")
+@router.message(AdminMenuStates.menu, F.text == '👮\u200d♂️ Adminlar')
 async def admin_roles_menu(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
@@ -2562,7 +3801,7 @@ async def admin_roles_menu(message: Message, state: FSMContext):
     await show_admin_roles_menu(message, state)
 
 
-@router.message(AdminMenuStates.menu, F.text == "💳 To‘lov kartalari")
+@router.message(AdminMenuStates.menu, F.text == "💳 To'lov kartalari")
 async def admin_payment_cards_menu(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
@@ -2572,24 +3811,24 @@ async def admin_payment_cards_menu(message: Message, state: FSMContext):
     await show_admin_payment_cards_menu(message, state)
 
 
-@router.message(AdminPaymentCardsStates.menu, F.text == "➕ Karta qo‘shish")
+@router.message(AdminPaymentCardsStates.menu, F.text == "➕ Karta qo'shish")
 async def admin_card_add_start(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
         return
     await state.set_state(AdminPaymentCardsStates.add_number)
-    await message.answer("💳 Karta raqamini kiriting (mask yoki to‘liq):")
+    await message.answer("💳 Karta raqamini kiriting (mask yoki to'liq):")
 
 
 @router.message(AdminPaymentCardsStates.add_number)
 async def admin_card_add_number(message: Message, state: FSMContext):
     number = (message.text or "").strip()
     if len(number) < 8:
-        await message.answer("❌ Karta raqami noto‘g‘ri.")
+        await message.answer("❌ Karta raqami noto'g'ri.")
         return
     await state.update_data(card_number=number)
     await state.set_state(AdminPaymentCardsStates.add_holder)
-    await message.answer("👤 Karta egasi (ixtiyoriy). O‘tkazib yuborish uchun `-` yuboring.")
+    await message.answer("👤 Karta egasi (ixtiyoriy). O'tkazib yuborish uchun `-` yuboring.")
 
 
 @router.message(AdminPaymentCardsStates.add_holder)
@@ -2599,7 +3838,7 @@ async def admin_card_add_holder(message: Message, state: FSMContext):
         holder = None
     await state.update_data(holder_name=holder)
     await state.set_state(AdminPaymentCardsStates.add_bank)
-    await message.answer("🏦 Bank nomi (ixtiyoriy). O‘tkazib yuborish uchun `-` yuboring.")
+    await message.answer("🏦 Bank nomi (ixtiyoriy). O'tkazib yuborish uchun `-` yuboring.")
 
 
 @router.message(AdminPaymentCardsStates.add_bank)
@@ -2609,7 +3848,7 @@ async def admin_card_add_bank(message: Message, state: FSMContext):
         bank = None
     await state.update_data(bank_name=bank)
     await state.set_state(AdminPaymentCardsStates.add_sort)
-    await message.answer("🔢 Tartib (sort_order). Masalan: 1. O‘tkazib yuborish uchun `-` yuboring.")
+    await message.answer("🔢 Tartib (sort_order). Masalan: 1. O'tkazib yuborish uchun `-` yuboring.")
 
 
 @router.message(AdminPaymentCardsStates.add_sort)
@@ -2618,12 +3857,12 @@ async def admin_card_add_sort(message: Message, state: FSMContext):
     sort_order = 0
     if sort_text != "-":
         if not sort_text.isdigit():
-            await message.answer("❌ Faqat raqam yoki `-` yuboring.")
+            await message.answer('❌ Faqat raqam yoki `-` yuboring.')
             return
         sort_order = int(sort_text)
     await state.update_data(sort_order=sort_order)
     await state.set_state(AdminPaymentCardsStates.add_active)
-    await message.answer("✅ Aktiv qilinsinmi? `ha` yoki `yo‘q` yuboring.")
+    await message.answer("✅ Aktiv qilinsinmi? `ha` yoki `yo'q` yuboring.")
 
 
 @router.message(AdminPaymentCardsStates.add_active)
@@ -2646,47 +3885,47 @@ async def admin_card_add_active(message: Message, state: FSMContext):
     )
     await state.set_state(AdminPaymentCardsStates.menu)
     rows = await list_payment_cards(active_only=False)
-    text = "💳 <b>TO‘LOV KARTALARI</b>\n\n"
+    text = "💳 <b>TO'LOV KARTALARI</b>\n\n"
     for row in rows:
         text += format_card_line(row) + "\n"
-    await message.answer("✅ Karta qo‘shildi.\n\n" + text, reply_markup=admin_payment_cards_menu_keyboard())
+    await message.answer("✅ Karta qo'shildi.\n\n" + text, reply_markup=admin_payment_cards_menu_keyboard())
 
 
-@router.message(AdminPaymentCardsStates.menu, F.text == "✏️ Karta tahrirlash")
+@router.message(AdminPaymentCardsStates.menu, F.text == '✏️ Karta tahrirlash')
 async def admin_card_edit_start(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
         return
     await state.set_state(AdminPaymentCardsStates.edit_select)
-    await message.answer("✏️ Tahrirlash uchun karta ID yuboring:")
+    await message.answer('✏️ Tahrirlash uchun karta ID yuboring:')
 
 
 @router.message(AdminPaymentCardsStates.edit_select)
 async def admin_card_edit_select(message: Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("❌ ID faqat raqam bo‘lishi kerak.")
+        await message.answer("❌ ID faqat raqam bo'lishi kerak.")
         return
     card_id = int(message.text)
     row = await db.fetchrow("SELECT id FROM payment_cards WHERE id = $1", card_id)
     if not row:
-        await message.answer("❌ Karta topilmadi.")
+        await message.answer('❌ Karta topilmadi.')
         return
     await state.update_data(card_id=card_id)
     await state.set_state(AdminPaymentCardsStates.edit_field)
     await message.answer(
         "Qaysi maydon?\n"
-        "1 — Karta raqami\n"
-        "2 — Karta egasi\n"
-        "3 — Bank nomi\n"
-        "4 — Tartib (sort_order)\n"
-        "5 — Aktiv (ha/yo‘q)"
+        '1 — Karta raqami\n'
+        '2 — Karta egasi\n'
+        '3 — Bank nomi\n'
+        '4 — Tartib (sort_order)\n'
+        "5 — Aktiv (ha/yo'q)"
     )
 
 
 @router.message(AdminPaymentCardsStates.edit_field)
 async def admin_card_edit_field(message: Message, state: FSMContext):
     if message.text not in {"1", "2", "3", "4", "5"}:
-        await message.answer("❌ 1-5 ni tanlang.")
+        await message.answer('❌ 1-5 ni tanlang.')
         return
     field_map = {
         "1": "card_number",
@@ -2697,7 +3936,7 @@ async def admin_card_edit_field(message: Message, state: FSMContext):
     }
     await state.update_data(field=field_map[message.text])
     await state.set_state(AdminPaymentCardsStates.edit_value)
-    await message.answer("✍️ Yangi qiymatni yuboring:")
+    await message.answer('✍️ Yangi qiymatni yuboring:')
 
 
 @router.message(AdminPaymentCardsStates.edit_value)
@@ -2709,7 +3948,7 @@ async def admin_card_edit_value(message: Message, state: FSMContext):
 
     if field == "sort_order":
         if not value.isdigit():
-            await message.answer("❌ Faqat raqam.")
+            await message.answer('❌ Faqat raqam.')
             return
         value = int(value)
     if field == "active":
@@ -2727,52 +3966,52 @@ async def admin_card_edit_value(message: Message, state: FSMContext):
     )
     await state.set_state(AdminPaymentCardsStates.menu)
     rows = await list_payment_cards(active_only=False)
-    text = "💳 <b>TO‘LOV KARTALARI</b>\n\n"
+    text = "💳 <b>TO'LOV KARTALARI</b>\n\n"
     for row in rows:
         text += format_card_line(row) + "\n"
-    await message.answer("✅ Karta yangilandi.\n\n" + text, reply_markup=admin_payment_cards_menu_keyboard())
+    await message.answer('✅ Karta yangilandi.\n\n' + text, reply_markup=admin_payment_cards_menu_keyboard())
 
 
-@router.message(AdminPaymentCardsStates.menu, F.text == "❌ Karta o‘chirish")
+@router.message(AdminPaymentCardsStates.menu, F.text == "❌ Karta o'chirish")
 async def admin_card_delete_start(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
         return
     await state.set_state(AdminPaymentCardsStates.delete_select)
-    await message.answer("❌ O‘chirish uchun karta ID yuboring:")
+    await message.answer("❌ O'chirish uchun karta ID yuboring:")
 
 
 @router.message(AdminPaymentCardsStates.delete_select)
 async def admin_card_delete_select(message: Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("❌ ID faqat raqam bo‘lishi kerak.")
+        await message.answer("❌ ID faqat raqam bo'lishi kerak.")
         return
     card_id = int(message.text)
     await db.execute("DELETE FROM payment_cards WHERE id = $1", card_id)
     await state.set_state(AdminPaymentCardsStates.menu)
     rows = await list_payment_cards(active_only=False)
-    text = "💳 <b>TO‘LOV KARTALARI</b>\n\n"
+    text = "💳 <b>TO'LOV KARTALARI</b>\n\n"
     if not rows:
-        text += "Hozircha karta yo‘q."
+        text += "Hozircha karta yo'q."
     else:
         for row in rows:
             text += format_card_line(row) + "\n"
-    await message.answer("✅ Karta o‘chirildi.\n\n" + text, reply_markup=admin_payment_cards_menu_keyboard())
+    await message.answer("✅ Karta o'chirildi.\n\n" + text, reply_markup=admin_payment_cards_menu_keyboard())
 
 
-@router.message(AdminPaymentCardsStates.menu, F.text == "✅ Aktiv qilish")
+@router.message(AdminPaymentCardsStates.menu, F.text == '✅ Aktiv qilish')
 async def admin_card_activate_start(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
         return
     await state.set_state(AdminPaymentCardsStates.activate_select)
-    await message.answer("✅ Aktiv qilmoqchi bo‘lgan karta ID yuboring:")
+    await message.answer("✅ Aktiv qilmoqchi bo'lgan karta ID yuboring:")
 
 
 @router.message(AdminPaymentCardsStates.activate_select)
 async def admin_card_activate_select(message: Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("❌ ID faqat raqam bo‘lishi kerak.")
+        await message.answer("❌ ID faqat raqam bo'lishi kerak.")
         return
     card_id = int(message.text)
     await db.execute(
@@ -2782,25 +4021,25 @@ async def admin_card_activate_select(message: Message, state: FSMContext):
     )
     await state.set_state(AdminPaymentCardsStates.menu)
     rows = await list_payment_cards(active_only=False)
-    text = "💳 <b>TO‘LOV KARTALARI</b>\n\n"
+    text = "💳 <b>TO'LOV KARTALARI</b>\n\n"
     for row in rows:
         text += format_card_line(row) + "\n"
-    await message.answer("✅ Karta aktiv qilindi.\n\n" + text, reply_markup=admin_payment_cards_menu_keyboard())
+    await message.answer('✅ Karta aktiv qilindi.\n\n' + text, reply_markup=admin_payment_cards_menu_keyboard())
 
 
-@router.message(AdminPaymentCardsStates.menu, F.text == "🚫 Aktivni o‘chirish")
+@router.message(AdminPaymentCardsStates.menu, F.text == "🚫 Aktivni o'chirish")
 async def admin_card_deactivate_start(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
         return
     await state.set_state(AdminPaymentCardsStates.deactivate_select)
-    await message.answer("🚫 Aktivini o‘chirmoqchi bo‘lgan karta ID yuboring:")
+    await message.answer("🚫 Aktivini o'chirmoqchi bo'lgan karta ID yuboring:")
 
 
 @router.message(AdminPaymentCardsStates.deactivate_select)
 async def admin_card_deactivate_select(message: Message, state: FSMContext):
     if not message.text.isdigit():
-        await message.answer("❌ ID faqat raqam bo‘lishi kerak.")
+        await message.answer("❌ ID faqat raqam bo'lishi kerak.")
         return
     card_id = int(message.text)
     await db.execute(
@@ -2810,39 +4049,39 @@ async def admin_card_deactivate_select(message: Message, state: FSMContext):
     )
     await state.set_state(AdminPaymentCardsStates.menu)
     rows = await list_payment_cards(active_only=False)
-    text = "💳 <b>TO‘LOV KARTALARI</b>\n\n"
+    text = "💳 <b>TO'LOV KARTALARI</b>\n\n"
     for row in rows:
         text += format_card_line(row) + "\n"
-    await message.answer("✅ Karta deaktiv qilindi.\n\n" + text, reply_markup=admin_payment_cards_menu_keyboard())
+    await message.answer('✅ Karta deaktiv qilindi.\n\n' + text, reply_markup=admin_payment_cards_menu_keyboard())
 
 
-@router.message(AdminPaymentCardsStates.menu, F.text == "⬅️ Orqaga")
+@router.message(AdminPaymentCardsStates.menu, F.text == '⬅️ Orqaga')
 async def admin_payment_cards_back(message: Message, state: FSMContext):
     await state.set_state(AdminMenuStates.menu)
     role = await get_admin_role(message.from_user.id)
     await message.answer("🛠 ADMIN PANEL", reply_markup=admin_menu_keyboard(role))
 
 
-@router.message(AdminMenuStates.menu, F.text == "📌 Kanal ulash")
+@router.message(AdminMenuStates.menu, F.text == '📌 Kanal ulash')
 async def admin_logchat_menu(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
         return
     await state.set_state(AdminLogChatStates.menu)
 
-    enabled = "✅ Yoqilgan" if await is_log_enabled() else "❌ O‘chirilgan"
+    enabled = '✅ Yoqilgan' if await is_log_enabled() else "❌ O'chirilgan"
     channel_username = await get_log_channel_username()
-    chat_text = channel_username if channel_username else "—"
+    chat_text = channel_username if channel_username else '—'
 
     text = (
-        "📌 <b>KANAL LOG SOZLAMALARI</b>\n\n"
+        '📌 <b>KANAL LOG SOZLAMALARI</b>\n\n'
         f"🔗 Kanal username: {chat_text}\n"
         f"⚙️ Holat: {enabled}\n"
     )
     await message.answer(text, reply_markup=admin_logchat_menu_keyboard())
 
 
-@router.message(AdminLogChatStates.menu, F.text == "🔗 Kanal username o‘rnatish")
+@router.message(AdminLogChatStates.menu, F.text == "🔗 Kanal username o'rnatish")
 async def admin_logchat_set_id_start(message: Message, state: FSMContext):
     await state.set_state(AdminLogChatStates.set_chat_id)
     await message.answer("Kanal username yuboring (masalan: @almaz_log):")
@@ -2852,45 +4091,45 @@ async def admin_logchat_set_id_start(message: Message, state: FSMContext):
 async def admin_logchat_set_id_save(message: Message, state: FSMContext):
     raw = (message.text or "").strip()
     if not raw:
-        await message.answer("❌ Username bo‘sh bo‘lishi mumkin emas.")
+        await message.answer("❌ Username bo'sh bo'lishi mumkin emas.")
         return
     await set_setting("approved_channel_username", raw)
     await state.set_state(AdminLogChatStates.menu)
-    await message.answer("✅ Username saqlandi.", reply_markup=admin_logchat_menu_keyboard())
+    await message.answer('✅ Username saqlandi.', reply_markup=admin_logchat_menu_keyboard())
 
 
-@router.message(AdminLogChatStates.menu, F.text == "✅ Yoqish/O‘chirish")
+@router.message(AdminLogChatStates.menu, F.text == "✅ Yoqish/O'chirish")
 async def admin_logchat_toggle(message: Message, state: FSMContext):
     current = await is_log_enabled()
     await set_setting("approved_channel_enabled", "false" if current else "true")
-    await message.answer("✅ Holat yangilandi.", reply_markup=admin_logchat_menu_keyboard())
+    await message.answer('✅ Holat yangilandi.', reply_markup=admin_logchat_menu_keyboard())
 
 
-@router.message(AdminLogChatStates.menu, F.text == "🧪 Test yuborish")
+@router.message(AdminLogChatStates.menu, F.text == '🧪 Test yuborish')
 async def admin_logchat_test(message: Message, state: FSMContext):
     try:
         channel_id, err = await resolve_log_channel_id(message.bot)
         if err:
             await message.answer(f"❌ {err}", reply_markup=admin_logchat_menu_keyboard())
             return
-        await message.bot.send_message(channel_id, "✅ Log kanal test xabari.")
-        await message.answer("✅ Test yuborildi.", reply_markup=admin_logchat_menu_keyboard())
+        await message.bot.send_message(channel_id, '✅ Log kanal test xabari.')
+        await message.answer('✅ Test yuborildi.', reply_markup=admin_logchat_menu_keyboard())
     except TelegramBadRequest:
-        await message.answer("❌ Kanal topilmadi. Username noto‘g‘ri yoki bot kanalga qo‘shilmagan.", reply_markup=admin_logchat_menu_keyboard())
+        await message.answer("❌ Kanal topilmadi. Username noto'g'ri yoki bot kanalga qo'shilmagan.", reply_markup=admin_logchat_menu_keyboard())
     except TelegramForbiddenError:
-        await message.answer("❌ Bot kanalga yozolmayapti. Botni kanalga admin qiling.", reply_markup=admin_logchat_menu_keyboard())
+        await message.answer('❌ Bot kanalga yozolmayapti. Botni kanalga admin qiling.', reply_markup=admin_logchat_menu_keyboard())
     except Exception:
-        await message.answer("❌ Test yuborilmadi. Kanal sozlamasini tekshiring.", reply_markup=admin_logchat_menu_keyboard())
+        await message.answer('❌ Test yuborilmadi. Kanal sozlamasini tekshiring.', reply_markup=admin_logchat_menu_keyboard())
 
 
-@router.message(AdminLogChatStates.menu, F.text == "⬅️ Orqaga")
+@router.message(AdminLogChatStates.menu, F.text == '⬅️ Orqaga')
 async def admin_logchat_back(message: Message, state: FSMContext):
     await state.set_state(AdminMenuStates.menu)
     role = await get_admin_role(message.from_user.id)
     await message.answer("🛠 ADMIN PANEL", reply_markup=admin_menu_keyboard(role))
 
 
-@router.message(F.text.in_({"⬅️ Orqaga", "🔙 Orqaga", "↩️ Orqaga"}))
+@router.message(F.text.in_({'⬅️ Orqaga', '🔙 Orqaga', '↩️ Orqaga'}))
 async def admin_universal_back(message: Message, state: FSMContext):
     role = await get_admin_role(message.from_user.id)
     if not role:
@@ -2908,7 +4147,7 @@ async def admin_universal_back(message: Message, state: FSMContext):
 async def admin_universal_back_callback(callback: CallbackQuery, state: FSMContext):
     role = await get_admin_role(callback.from_user.id)
     if not role:
-        await callback.answer("⛔ Sizda ruxsat yo‘q", show_alert=True)
+        await callback.answer("⛔ Sizda ruxsat yo'q", show_alert=True)
         return
     stack = await get_nav_stack(state)
     if stack:
@@ -2919,14 +4158,14 @@ async def admin_universal_back_callback(callback: CallbackQuery, state: FSMConte
     await render_admin_menu_by_key(callback.message, state, key)
     await callback.answer()
 
-@router.message(AdminRoleStates.menu, F.text == "➕ Admin qo‘shish")
+@router.message(AdminRoleStates.menu, F.text == "➕ Admin qo'shish")
 async def admin_role_add_start(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
         return
 
     await state.set_state(AdminRoleStates.add_id)
-    await message.answer("➕ Admin qo‘shish uchun Telegram ID yuboring:")
+    await message.answer("➕ Admin qo'shish uchun Telegram ID yuboring:")
 
 
 @router.message(AdminRoleStates.add_id)
@@ -2936,16 +4175,16 @@ async def admin_role_add_id(message: Message, state: FSMContext):
         return
 
     if not message.text.isdigit():
-        await message.answer("❌ ID faqat raqam bo‘lishi kerak")
+        await message.answer("❌ ID faqat raqam bo'lishi kerak")
         return
 
     await state.update_data(target_admin_id=int(message.text))
     await state.set_state(AdminRoleStates.add_role)
     await message.answer(
         "Rolni tanlang:\n"
-        "1 — SUPERADMIN\n"
-        "2 — MAIN ADMIN\n"
-        "3 — VIEWER"
+        '1 — SUPERADMIN\n'
+        '2 — MAIN ADMIN\n'
+        '3 — VIEWER'
     )
 
 
@@ -2957,7 +4196,7 @@ async def admin_role_add_save(message: Message, state: FSMContext):
 
     new_role = parse_role(message.text)
     if not new_role:
-        await message.answer("❌ Noto‘g‘ri rol. 1/2/3 yuboring.")
+        await message.answer("❌ Noto'g'ri rol. 1/2/3 yuboring.")
         return
 
     data = await state.get_data()
@@ -2983,14 +4222,14 @@ async def admin_role_add_save(message: Message, state: FSMContext):
     )
 
 
-@router.message(AdminRoleStates.menu, F.text == "✏️ Admin roli")
+@router.message(AdminRoleStates.menu, F.text == '✏️ Admin roli')
 async def admin_role_edit_start(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
         return
 
     await state.set_state(AdminRoleStates.edit_select)
-    await message.answer("✏️ Roli o‘zgartiriladigan admin ID ni yuboring:")
+    await message.answer("✏️ Roli o'zgartiriladigan admin ID ni yuboring:")
 
 
 @router.message(AdminRoleStates.edit_select)
@@ -3000,16 +4239,16 @@ async def admin_role_edit_select(message: Message, state: FSMContext):
         return
 
     if not message.text.isdigit():
-        await message.answer("❌ ID faqat raqam bo‘lishi kerak")
+        await message.answer("❌ ID faqat raqam bo'lishi kerak")
         return
 
     await state.update_data(target_admin_id=int(message.text))
     await state.set_state(AdminRoleStates.edit_role)
     await message.answer(
         "Yangi rol:\n"
-        "1 — SUPERADMIN\n"
-        "2 — MAIN ADMIN\n"
-        "3 — VIEWER"
+        '1 — SUPERADMIN\n'
+        '2 — MAIN ADMIN\n'
+        '3 — VIEWER'
     )
 
 
@@ -3021,7 +4260,7 @@ async def admin_role_edit_save(message: Message, state: FSMContext):
 
     new_role = parse_role(message.text)
     if not new_role:
-        await message.answer("❌ Noto‘g‘ri rol. 1/2/3 yuboring.")
+        await message.answer("❌ Noto'g'ri rol. 1/2/3 yuboring.")
         return
 
     data = await state.get_data()
@@ -3040,14 +4279,14 @@ async def admin_role_edit_save(message: Message, state: FSMContext):
     )
 
 
-@router.message(AdminRoleStates.menu, F.text == "❌ Admin o‘chirish")
+@router.message(AdminRoleStates.menu, F.text == "❌ Admin o'chirish")
 async def admin_role_remove_start(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
         return
 
     await state.set_state(AdminRoleStates.remove_select)
-    await message.answer("❌ O‘chiriladigan admin ID ni yuboring:")
+    await message.answer("❌ O'chiriladigan admin ID ni yuboring:")
 
 
 @router.message(AdminRoleStates.remove_select)
@@ -3057,7 +4296,7 @@ async def admin_role_remove_save(message: Message, state: FSMContext):
         return
 
     if not message.text.isdigit():
-        await message.answer("❌ ID faqat raqam bo‘lishi kerak")
+        await message.answer("❌ ID faqat raqam bo'lishi kerak")
         return
 
     target_id = int(message.text)
@@ -3069,12 +4308,12 @@ async def admin_role_remove_save(message: Message, state: FSMContext):
 
     await state.set_state(AdminRoleStates.menu)
     await message.answer(
-        f"✅ Admin o‘chirildi: {target_id}",
+        f"✅ Admin o'chirildi: {target_id}",
         reply_markup=admin_roles_menu_keyboard()
     )
 
 
-@router.message(AdminRoleStates.menu, F.text == "⬅️ Orqaga")
+@router.message(AdminRoleStates.menu, F.text == '⬅️ Orqaga')
 async def admin_role_back(message: Message, state: FSMContext):
     await state.set_state(AdminMenuStates.menu)
     role = await get_admin_role(message.from_user.id)
@@ -3084,23 +4323,23 @@ async def admin_role_back(message: Message, state: FSMContext):
     )
 
 
-@router.message(AdminRoleStates.add_id, F.text == "⬅️ Orqaga")
-@router.message(AdminRoleStates.add_role, F.text == "⬅️ Orqaga")
-@router.message(AdminRoleStates.edit_select, F.text == "⬅️ Orqaga")
-@router.message(AdminRoleStates.edit_role, F.text == "⬅️ Orqaga")
-@router.message(AdminRoleStates.remove_select, F.text == "⬅️ Orqaga")
+@router.message(AdminRoleStates.add_id, F.text == '⬅️ Orqaga')
+@router.message(AdminRoleStates.add_role, F.text == '⬅️ Orqaga')
+@router.message(AdminRoleStates.edit_select, F.text == '⬅️ Orqaga')
+@router.message(AdminRoleStates.edit_role, F.text == '⬅️ Orqaga')
+@router.message(AdminRoleStates.remove_select, F.text == '⬅️ Orqaga')
 async def admin_role_back_to_list(message: Message, state: FSMContext):
     await state.set_state(AdminRoleStates.menu)
     rows = await db.fetch(
         "SELECT user_id, role, active FROM admins ORDER BY role, user_id"
     )
-    text = "👮‍♂️ <b>ADMINLAR</b>\n\n"
+    text = '👮\u200d♂️ <b>ADMINLAR</b>\n\n'
     if not rows:
-        text += "Hozircha adminlar yo‘q."
+        text += "Hozircha adminlar yo'q."
     else:
         for row in rows:
             r = row["role"]
-            status = "🟢" if row["active"] else "🔴"
+            status = '🟢' if row["active"] else '🔴'
             text += f"{status} {row['user_id']} — {ROLE_LABELS.get(r, r)}\n"
 
     await message.answer(text, reply_markup=admin_roles_menu_keyboard())
@@ -3121,7 +4360,7 @@ async def prices_back_handler(callback: CallbackQuery):
     await show_main_menu_callback(callback)
     await callback.answer()
 
-@router.message(AdminMenuStates.menu, F.text == "💰 Narxlar matnini tahrirlash")
+@router.message(AdminMenuStates.menu, F.text == '💰 Narxlar matnini tahrirlash')
 async def admin_edit_prices(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
@@ -3130,20 +4369,20 @@ async def admin_edit_prices(message: Message, state: FSMContext):
     await state.set_state(AdminEditPricesStates.waiting_text)
 
     await message.answer(
-        "✍️ Yangi narxlar matnini yuboring:\n\n"
+        '✍️ Yangi narxlar matnini yuboring:\n\n'
         "Markdown ishlatish mumkin.\n"
         "Masalan:\n"
-        "200 💎 — 25 000 so‘m",
+        "200 💎 — 25 000 so'm",
         reply_markup=back_only_keyboard()
     )
 
 @router.message(AdminEditPricesStates.waiting_text)
 async def admin_save_prices(message: Message, state: FSMContext):
-    if message.text == "⬅️ Orqaga":
+    if message.text == '⬅️ Orqaga':
         await state.set_state(AdminMenuStates.menu)
         role = await get_admin_role(message.from_user.id)
         await message.answer(
-            "🛠 ADMIN PANEL\n\nKerakli bo‘limni tanlang:",
+            "🛠 ADMIN PANEL\n\nKerakli bo'limni tanlang:",
             reply_markup=admin_menu_keyboard(role)
         )
         return
@@ -3157,11 +4396,11 @@ async def admin_save_prices(message: Message, state: FSMContext):
 
     role = await get_admin_role(message.from_user.id)
     await message.answer(
-        "✅ Narxlar muvaffaqiyatli yangilandi",
+        '✅ Narxlar muvaffaqiyatli yangilandi',
         reply_markup=admin_menu_keyboard(role)
     )
 
-@router.message(AdminMenuStates.menu, F.text == "🧾 Buyurtmalar")
+@router.message(AdminMenuStates.menu, F.text == '🧾 Buyurtmalar')
 async def admin_orders_menu(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN, ADMIN_ROLE_VIEWER))
     if not role:
@@ -3178,26 +4417,26 @@ async def admin_orders_menu(message: Message, state: FSMContext):
     )
 
     if not orders:
-        await message.answer("🧾 Buyurtmalar yo‘q")
+        await message.answer("🧾 Buyurtmalar yo'q")
         return
 
-    text = "🧾 OXIRGI 10 BUYURTMA\n\n"
+    text = '🧾 OXIRGI 10 BUYURTMA\n\n'
 
     for o in orders:
         text += (
             f"🆔 #{o['id']} | {o['status']}\n"
-            f"📦 {o['product_name']} | 💎 {o['almaz']} | 💰 {o['price']:,} so‘m\n\n"
+            f"📦 {o['product_name']} | 💎 {o['almaz']} | 💰 {o['price']:,} so'm\n\n"
         )
 
     text += (
-        "✍️ Batafsil ko‘rish uchun BUYURTMA ID ni yuboring\n"
-        "⬅️ Orqaga qaytish uchun tugmani bosing"
+        "✍️ Batafsil ko'rish uchun BUYURTMA ID ni yuboring\n"
+        '⬅️ Orqaga qaytish uchun tugmani bosing'
     )
 
     await state.set_state(AdminOrdersStates.waiting_order_id)
     await message.answer(text, reply_markup=orders_back_keyboard())
 
-@router.message(AdminMenuStates.menu, F.text == "📊 Daromad statistikasi")
+@router.message(AdminMenuStates.menu, F.text == '📊 Daromad statistikasi')
 async def admin_revenue_stats(message: Message):
     role = await require_role(message, PERM_REVENUE_ROLES)
     if not role:
@@ -3212,7 +4451,7 @@ async def admin_revenue_stats(message: Message):
         "Oxirgi 30 kun": now - timedelta(days=30),
     }
 
-    text = "📊 DAROMAD STATISTIKASI\n\n"
+    text = '📊 DAROMAD STATISTIKASI\n\n'
 
     # 🟢 BUYURTMALAR SONI + DAROMAD
     for title, since in periods.items():
@@ -3231,7 +4470,7 @@ async def admin_revenue_stats(message: Message):
         text += (
             f"🗓 {title}\n"
             f"🧾 Buyurtmalar: {count}\n"
-            f"💰 Daromad: {total:,} so‘m\n\n"
+            f"💰 Daromad: {total:,} so'm\n\n"
         )   
 
     # 🔥 OXIRGI 7 KUNLIK TOP PAKETLAR
@@ -3250,14 +4489,14 @@ async def admin_revenue_stats(message: Message):
     )
 
     if top_packages:
-        text += "🔥 OXIRGI 7 KUNLIK TOP PAKETLAR\n\n"
+        text += '🔥 OXIRGI 7 KUNLIK TOP PAKETLAR\n\n'
         for row in top_packages:
             name = row["product_name"]
             qty = row["qty_sum"]
             total_sum = row["price_sum"]
             text += (
                 f"📦 {name}\n"
-                f"🧾 {qty} ta | 💰 {total_sum:,} so‘m\n\n"
+                f"🧾 {qty} ta | 💰 {total_sum:,} so'm\n\n"
             )
 
     # ✅ FAQAT BIR MARTA XABAR YUBORILADI
@@ -3334,8 +4573,8 @@ async def admin_stats_back_menu(callback: CallbackQuery, state: FSMContext):
     try:
         await callback.message.delete()
     except Exception:
-        await safe_edit(callback, "ADMIN PANEL", reply_markup=None, allow_photo=True)
-    await callback.message.answer("ADMIN PANEL", reply_markup=admin_menu_keyboard(role))
+        await safe_edit(callback, "🛠 ADMIN PANEL", reply_markup=None, allow_photo=True)
+    await callback.message.answer("🛠 ADMIN PANEL", reply_markup=admin_menu_keyboard(role))
     await callback.answer()
 
 
@@ -3427,12 +4666,12 @@ async def package_selected_handler(callback: CallbackQuery, state: FSMContext):
     )
 
     if not pkg:
-        await callback.answer("❌ Paket topilmadi", show_alert=True)
+        await callback.answer('❌ Paket topilmadi', show_alert=True)
         return
 
     name, almaz, price = pkg["name"], pkg["almaz"], pkg["price"]
 
-    # 🔥 VOUCHER bo‘lsa
+    # 🔥 VOUCHER bo'lsa
     if "haftalik" in name.lower() or "oylik" in name.lower():
         await state.update_data(
             package_id=pkg_id,
@@ -3448,8 +4687,8 @@ async def package_selected_handler(callback: CallbackQuery, state: FSMContext):
             callback,
             f"{name}\n\n"
             f"💎 {almaz} almaz / 1 dona\n"
-            f"💰 {price:,} so‘m / 1 dona\n\n"
-            "🧮 Nechta dona olmoqchisiz?",
+            f"💰 {price:,} so'm / 1 dona\n\n"
+            '🧮 Nechta dona olmoqchisiz?',
             reply_markup=voucher_quantity_keyboard(pkg_id)
         )
         await callback.answer()
@@ -3467,19 +4706,21 @@ async def package_selected_handler(callback: CallbackQuery, state: FSMContext):
 
     await safe_edit(
         callback,
-        "✅ <b>PAKET TANLANDI</b>\n\n"
-        f"📦 Paket: {name}\n"
-        f"💎 Almaz: {almaz}\n"
-        f"💰 Narx: {price:,} so‘m\n\n"
-        "⚡ Yetkazish: 5–15 daqiqa\n"
-        "🔒 Xavfsiz va kafolatlangan\n\n"
-        "👉 Davom etamizmi?",
+        '🔥 <b>PAKET MUVAFFAQIYATLI TANLANDI</b>\n\n'
+        "Buyurtma tayyor. Quyidagi ma'lumotlarni tekshiring:\n\n"
+        f"📦 Paket: <b>{name}</b>\n"
+        f"💎 Almaz: <b>{almaz}</b>\n"
+        f"💰 Narx: <b>{price:,} so'm</b>\n\n"
+        '⚡ Almaz yetkazish: <b>5–35 daqiqa</b>\n'
+        "👮 Admin tomonidan qo'lda tasdiqlanadi\n"
+        '🛡 Xavfsiz va ishonchli jarayon\n\n'
+        '👇 Buyurtmani davom ettirish uchun tugmani bosing.',
         reply_markup=confirm_package_keyboard()
     )
 
     await callback.answer()
 
-@router.message(AdminMenuStates.menu, F.text == "🎁 Promokodlar")
+@router.message(AdminMenuStates.menu, F.text == '🎁 Promokodlar')
 async def admin_promocode_menu(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
@@ -3487,7 +4728,7 @@ async def admin_promocode_menu(message: Message, state: FSMContext):
     await push_nav(state, "admin_promocodes")
     await show_admin_promocode_menu(message, state)
 
-@router.message(AdminPromoStates.menu, F.text == "➕ Promokod yaratish")
+@router.message(AdminPromoStates.menu, F.text == '➕ Promokod yaratish')
 async def admin_add_promo_start(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
@@ -3495,7 +4736,7 @@ async def admin_add_promo_start(message: Message, state: FSMContext):
 
     await state.set_state(AdminPromoStates.add_code)
     await message.answer(
-        "🔤 Promokod nomini kiriting:",
+        '🔤 Promokod nomini kiriting:',
         reply_markup=promo_input_cancel_keyboard()
     )
 
@@ -3506,15 +4747,15 @@ async def admin_add_promo_code(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
         return
-    if message.text == "❌ Bekor qilish":
+    if message.text == '❌ Bekor qilish':
         await state.set_state(AdminPromoStates.menu)
         await message.answer(
             "Bekor qilindi.",
             reply_markup=admin_promocode_menu_keyboard()
         )
         return
-    if not message.text or message.text.strip().startswith("➕"):
-        await message.answer("❌ Promokod nomini oddiy matn qilib kiriting.")
+    if not message.text or message.text.strip().startswith('➕'):
+        await message.answer('❌ Promokod nomini oddiy matn qilib kiriting.')
         return
 
     await state.update_data(code=message.text.upper())
@@ -3527,7 +4768,7 @@ async def admin_add_promo_almaz(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
         return
-    if message.text == "❌ Bekor qilish":
+    if message.text == '❌ Bekor qilish':
         await state.set_state(AdminPromoStates.menu)
         await message.answer(
             "Bekor qilindi.",
@@ -3536,7 +4777,7 @@ async def admin_add_promo_almaz(message: Message, state: FSMContext):
         return
 
     if not message.text.isdigit():
-        await message.answer("❌ Faqat raqam kiriting")
+        await message.answer('❌ Faqat raqam kiriting')
         return
 
     await state.update_data(almaz=int(message.text))
@@ -3549,7 +4790,7 @@ async def admin_add_promo_limit(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
         return
-    if message.text == "❌ Bekor qilish":
+    if message.text == '❌ Bekor qilish':
         await state.set_state(AdminPromoStates.menu)
         await message.answer(
             "Bekor qilindi.",
@@ -3558,14 +4799,14 @@ async def admin_add_promo_limit(message: Message, state: FSMContext):
         return
 
     if not message.text.isdigit():
-        await message.answer("❌ Faqat raqam kiriting")
+        await message.answer('❌ Faqat raqam kiriting')
         return
 
     await state.update_data(max_uses=int(message.text))
     await state.set_state(AdminPromoStates.add_expire)
 
     await message.answer(
-        "⏰ Amal qilish muddati (kunlarda).\n"
+        '⏰ Amal qilish muddati (kunlarda).\n'
         "Agar cheklanmasin desangiz: 0 yozing",
         reply_markup=promo_input_cancel_keyboard()
     )
@@ -3575,7 +4816,7 @@ async def admin_add_promo_save(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
         return
-    if message.text == "❌ Bekor qilish":
+    if message.text == '❌ Bekor qilish':
         await state.set_state(AdminPromoStates.menu)
         await message.answer(
             "Bekor qilindi.",
@@ -3587,7 +4828,7 @@ async def admin_add_promo_save(message: Message, state: FSMContext):
     now = utc_now()
 
     if not message.text.isdigit():
-        await message.answer("❌ Faqat raqam kiriting")
+        await message.answer('❌ Faqat raqam kiriting')
         return
 
     days = int(message.text)
@@ -3612,7 +4853,7 @@ async def admin_add_promo_save(message: Message, state: FSMContext):
     await state.set_state(AdminPromoStates.menu)
 
     await message.answer(
-        "✅ Promokod muvaffaqiyatli yaratildi!",
+        '✅ Promokod muvaffaqiyatli yaratildi!',
         reply_markup=admin_promocode_menu_keyboard()
     )
 
@@ -3622,10 +4863,10 @@ async def admin_add_promo_save(message: Message, state: FSMContext):
 @router.callback_query(AdminPromoStates.add_max_uses)
 @router.callback_query(AdminPromoStates.add_expire)
 async def admin_promo_input_callback_guard(callback: CallbackQuery):
-    await callback.answer("Iltimos promokod ma’lumotini matn qilib kiriting.", show_alert=True)
+    await callback.answer("Iltimos promokod ma'lumotini matn qilib kiriting.", show_alert=True)
 
 
-@router.message(AdminMenuStates.menu, F.text == "📦 Paketlar")
+@router.message(AdminMenuStates.menu, F.text == '📦 Paketlar')
 async def admin_packages_menu(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
@@ -3634,14 +4875,14 @@ async def admin_packages_menu(message: Message, state: FSMContext):
     await push_nav(state, "admin_packages")
     await show_admin_packages_menu(message, state)
 
-@router.message(AdminPackagesStates.menu, F.text == "➕ Paket qo‘shish")
+@router.message(AdminPackagesStates.menu, F.text == "➕ Paket qo'shish")
 async def admin_add_package_start(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
         return
 
     await state.set_state(AdminPackagesStates.add_name)
-    await message.answer("✍️ Paket nomini kiriting:\nMasalan: 1000 💎")
+    await message.answer('✍️ Paket nomini kiriting:\nMasalan: 1000 💎')
 
 @router.message(AdminPackagesStates.add_name)
 async def admin_add_package_name(message: Message, state: FSMContext):
@@ -3652,7 +4893,7 @@ async def admin_add_package_name(message: Message, state: FSMContext):
     await state.update_data(name=message.text)
     await state.set_state(AdminPackagesStates.add_almaz)
 
-    await message.answer("💎 Almaz miqdorini kiriting:\nMasalan: 1000")
+    await message.answer('💎 Almaz miqdorini kiriting:\nMasalan: 1000')
 
 @router.message(AdminPackagesStates.add_almaz)
 async def admin_add_package_almaz(message: Message, state: FSMContext):
@@ -3661,13 +4902,13 @@ async def admin_add_package_almaz(message: Message, state: FSMContext):
         return
 
     if not message.text.isdigit():
-        await message.answer("❌ Faqat raqam kiriting")
+        await message.answer('❌ Faqat raqam kiriting')
         return
 
     await state.update_data(almaz=int(message.text))
     await state.set_state(AdminPackagesStates.add_price)
 
-    await message.answer("💰 Narxni kiriting (so‘m):\nMasalan: 120000")
+    await message.answer("💰 Narxni kiriting (so'm):\nMasalan: 120000")
 
 @router.message(AdminPackagesStates.add_price)
 async def admin_add_package_price(message: Message, state: FSMContext):
@@ -3676,7 +4917,7 @@ async def admin_add_package_price(message: Message, state: FSMContext):
         return
 
     if not message.text.isdigit():
-        await message.answer("❌ Faqat raqam kiriting")
+        await message.answer('❌ Faqat raqam kiriting')
         return
 
     data = await state.get_data()
@@ -3691,11 +4932,11 @@ async def admin_add_package_price(message: Message, state: FSMContext):
     await state.set_state(AdminPackagesStates.menu)
 
     await message.answer(
-        "✅ Paket muvaffaqiyatli qo‘shildi",
+        "✅ Paket muvaffaqiyatli qo'shildi",
         reply_markup=admin_packages_menu_keyboard()
     )
 
-@router.message(AdminPackagesStates.menu, F.text == "✏️ Paket tahrirlash")
+@router.message(AdminPackagesStates.menu, F.text == '✏️ Paket tahrirlash')
 async def admin_edit_package_start(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
@@ -3706,10 +4947,10 @@ async def admin_edit_package_start(message: Message, state: FSMContext):
     )
 
     if not packages:
-        await message.answer("❌ Tahrirlash uchun paket yo‘q")
+        await message.answer("❌ Tahrirlash uchun paket yo'q")
         return
 
-    text = "✏️ Tahrirlash uchun paketni TANLANG:\n\n"
+    text = '✏️ Tahrirlash uchun paketni TANLANG:\n\n'
     for pkg in packages:
         text += f"{pkg['id']}. {pkg['name']}\n"
 
@@ -3723,7 +4964,7 @@ async def admin_edit_package_choose(message: Message, state: FSMContext):
         return
 
     if not message.text.isdigit():
-        await message.answer("❌ Paket raqamini kiriting")
+        await message.answer('❌ Paket raqamini kiriting')
         return
 
     pkg_id = int(message.text)
@@ -3733,17 +4974,17 @@ async def admin_edit_package_choose(message: Message, state: FSMContext):
         pkg_id,
     )
     if not row:
-        await message.answer("❌ Paket topilmadi")
+        await message.answer('❌ Paket topilmadi')
         return
 
     await state.update_data(package_id=pkg_id)
     await state.set_state(AdminPackagesStates.edit_field)
 
     await message.answer(
-        "Qaysi maydonni o‘zgartiramiz?\n\n"
-        "1 — Nomi\n"
-        "2 — Almaz miqdori\n"
-        "3 — Narxi"
+        "Qaysi maydonni o'zgartiramiz?\n\n"
+        '1 — Nomi\n'
+        '2 — Almaz miqdori\n'
+        '3 — Narxi'
     )
 
 @router.message(AdminPackagesStates.edit_field)
@@ -3753,7 +4994,7 @@ async def admin_edit_package_field(message: Message, state: FSMContext):
         return
 
     if message.text not in ["1", "2", "3"]:
-        await message.answer("❌ 1, 2 yoki 3 ni tanlang")
+        await message.answer('❌ 1, 2 yoki 3 ni tanlang')
         return
 
     field_map = {
@@ -3765,7 +5006,7 @@ async def admin_edit_package_field(message: Message, state: FSMContext):
     await state.update_data(field=field_map[message.text])
     await state.set_state(AdminPackagesStates.edit_value)
 
-    await message.answer("✍️ Yangi qiymatni kiriting")
+    await message.answer('✍️ Yangi qiymatni kiriting')
 
 @router.message(AdminPackagesStates.edit_value)
 async def admin_edit_package_save(message: Message, state: FSMContext):
@@ -3780,7 +5021,7 @@ async def admin_edit_package_save(message: Message, state: FSMContext):
     value = message.text
 
     if field in ["almaz", "price"] and not value.isdigit():
-        await message.answer("❌ Faqat raqam kiriting")
+        await message.answer('❌ Faqat raqam kiriting')
         return
 
     await db.execute(
@@ -3792,11 +5033,11 @@ async def admin_edit_package_save(message: Message, state: FSMContext):
     await state.set_state(AdminPackagesStates.menu)
 
     await message.answer(
-        "✅ Paket muvaffaqiyatli yangilandi",
+        '✅ Paket muvaffaqiyatli yangilandi',
         reply_markup=admin_packages_menu_keyboard()
     )
 
-@router.message(AdminPackagesStates.menu, F.text == "❌ Paket o‘chirish")
+@router.message(AdminPackagesStates.menu, F.text == "❌ Paket o'chirish")
 async def admin_delete_package_start(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
@@ -3807,10 +5048,10 @@ async def admin_delete_package_start(message: Message, state: FSMContext):
     )
 
     if not packages:
-        await message.answer("❌ O‘chirish uchun paket yo‘q")
+        await message.answer("❌ O'chirish uchun paket yo'q")
         return
 
-    text = "❌ O‘chirmoqchi bo‘lgan paket RAQAMINI yuboring:\n\n"
+    text = "❌ O'chirmoqchi bo'lgan paket RAQAMINI yuboring:\n\n"
     for pkg in packages:
         text += f"{pkg['id']}. {pkg['name']}\n"
 
@@ -3824,7 +5065,7 @@ async def admin_delete_package_confirm(message: Message, state: FSMContext):
         return
 
     if not message.text.isdigit():
-        await message.answer("❌ Faqat paket raqamini yuboring")
+        await message.answer('❌ Faqat paket raqamini yuboring')
         return
 
     pkg_id = int(message.text)
@@ -3834,7 +5075,7 @@ async def admin_delete_package_confirm(message: Message, state: FSMContext):
         pkg_id,
     )
     if not row:
-        await message.answer("❌ Bunday paket yo‘q")
+        await message.answer("❌ Bunday paket yo'q")
         return
 
     await db.execute(
@@ -3845,13 +5086,13 @@ async def admin_delete_package_confirm(message: Message, state: FSMContext):
     await state.set_state(AdminPackagesStates.menu)
 
     await message.answer(
-        "✅ Paket to‘liq o‘chirildi",
+        "✅ Paket to'liq o'chirildi",
         reply_markup=admin_packages_menu_keyboard()
     )
 
-@router.message(AdminPackagesStates.menu, F.text == "⬅️ Orqaga")
+@router.message(AdminPackagesStates.menu, F.text == '⬅️ Orqaga')
 async def admin_packages_back(message: Message, state: FSMContext):
-    # paketlar state’dan chiqamiz
+    # paketlar state'dan chiqamiz
     await state.set_state(AdminMenuStates.menu)
 
     role = await get_admin_role(message.from_user.id)
@@ -3863,27 +5104,39 @@ async def admin_packages_back(message: Message, state: FSMContext):
 async def build_balance_text(user_id: int, first_name: str) -> str | None:
     row = await db.fetchrow(
         """
-        SELECT almaz_balance, bonus_almaz, total_almaz
+        SELECT almaz_balance, bonus_almaz, total_almaz, money_balance
         FROM users WHERE user_id = $1
         """,
         user_id,
     )
     if not row:
         return None
-    almaz_balance, bonus_almaz, total_almaz = (
+    almaz_balance, bonus_almaz, total_almaz, money_sum = (
         row["almaz_balance"],
         row["bonus_almaz"],
         row["total_almaz"],
+        row["money_balance"],
     )
     return (
-        "BALANS MA'LUMOTI\n\n"
-        f"Ism: {first_name}\n"
-        f"Umumiy balansingiz: {almaz_balance} almaz\n"
-        f"Bonus orqali olingan: {bonus_almaz} almaz\n\n"
-        f"Jami sotib olingan: {total_almaz} almaz\n\n"
-        "Sotib olingan almazlar balansga yozilmaydi, to'g'ridan-to'g'ri FF akkauntga beriladi.\n"
-        "Har bir xariddan % bonus qaytariladi"
-    )
+    '👤 FOYDALANUVCHI BALANSI\n\n'
+
+    f"Ism: {first_name}\n\n"
+
+    '💎 Almaz balansi\n'
+    f"• Umumiy: {almaz_balance} almaz\n"
+    f"• Bonus orqali: {bonus_almaz} almaz\n\n"
+
+    '💰 Hisob balansi\n'
+    f"• So'm balans: {int(money_sum or 0):,} so'm\n\n"
+
+    '📊 Statistika\n'
+    f"• Jami sotib olingan: {total_almaz} almaz\n\n"
+
+    "?? Eslatma:\n"
+    "Sotib olingan almazlar balansga qo'shilmaydi.\n"
+    "Ular to'g'ridan-to'g'ri Free Fire akkauntingizga yuboriladi.\n"
+    "Har bir xariddan bonus ham beriladi."
+)
 
 
 @router.message(Command("balance"))
@@ -3896,7 +5149,10 @@ async def balance_command(message: Message):
 
 
 @router.callback_query(F.data == "balance")
-async def balance_handler(callback: CallbackQuery):
+async def balance_handler(callback: CallbackQuery, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state == BalanceTopupStates.waiting_check.state:
+        await state.clear()
     text = await build_balance_text(callback.from_user.id, callback.from_user.first_name)
     if not text:
         await callback.answer("Foydalanuvchi topilmadi", show_alert=True)
@@ -3905,10 +5161,61 @@ async def balance_handler(callback: CallbackQuery):
     await callback.answer()
 
 
+@router.callback_query(F.data == "balance_payment_stage")
+async def balance_payment_stage_handler(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(BalanceTopupStates.waiting_check)
+    active_cards = await list_payment_cards(active_only=True)
+    text = build_payment_stage_text(active_cards)
+    await safe_edit(callback, text, reply_markup=balance_payment_stage_back_keyboard())
+    await callback.answer()
+
+
+@router.message(BalanceTopupStates.waiting_check)
+async def balance_topup_check_handler(message: Message, state: FSMContext):
+    if not message.photo:
+        await message.answer('❌ Chek rasmini yuboring.')
+        return
+
+    user = message.from_user
+    photo_id = message.photo[-1].file_id
+    request_id = await create_balance_topup_request(user, photo_id)
+    await state.clear()
+
+    admin_text = (
+        "💰 SO'M BALANS TO'LDIRISH SO'ROVI\n\n"
+        f"🧾 So'rov raqami: #{request_id}\n"
+        f"👤 Foydalanuvchi: {user.full_name}\n"
+        f"🔗 Username: @{user.username if user.username else "yo'q"}\n"
+        f"🆔 User ID: {user.id}\n\n"
+        '📌 Holat: ⏳ Kutilmoqda\n'
+        '💬 Admin summani tekshirib tasdiqlaydi.'
+    )
+
+    admins = await get_admins()
+    for admin_id, role in admins:
+        if role not in (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN):
+            continue
+        try:
+            await message.bot.send_photo(
+                chat_id=admin_id,
+                photo=photo_id,
+                caption=admin_text,
+                reply_markup=admin_balance_topup_keyboard(request_id, user.id),
+            )
+        except Exception:
+            continue
+
+    await message.answer(
+        '✅ Chekingiz qabul qilindi.\n'
+        f"🧾 So'rov raqami: #{request_id}\n"
+        "Admin tekshirgach, so'm balansingiz to'ldiriladi."
+    )
+
+
 def withdraw_cancel_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="withdraw_cancel")]
+            [InlineKeyboardButton(text='⬅️ Orqaga', callback_data="withdraw_cancel")]
         ]
     )
 
@@ -3920,7 +5227,7 @@ def withdraw_amount_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f"{WITHDRAW_FIXED_AMOUNT} Almaz 💎", callback_data=f"wd_amount:{WITHDRAW_FIXED_AMOUNT}")],
-            [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="withdraw_cancel")],
+            [InlineKeyboardButton(text='⬅️ Orqaga', callback_data="withdraw_cancel")],
         ]
     )
 
@@ -3959,7 +5266,7 @@ async def withdraw_cancel_handler(callback: CallbackQuery, state: FSMContext):
 
 @router.message(WithdrawStates.waiting_amount)
 async def withdraw_receive_amount(message: Message, state: FSMContext):
-    if (message.text or "").strip() in {"⬅️ Orqaga", "Orqaga"}:
+    if (message.text or "").strip() in {'⬅️ Orqaga', "Orqaga"}:
         await state.clear()
         text = await build_balance_text(message.from_user.id, message.from_user.first_name)
         if text:
@@ -4001,7 +5308,7 @@ async def withdraw_receive_amount(message: Message, state: FSMContext):
     await state.set_state(WithdrawStates.waiting_ff_id)
     await state.update_data(withdraw_amount=WITHDRAW_FIXED_AMOUNT)
     await message.answer(
-        "🎮 Endi Free Fire ID raqamingizni yuboring.\nBekor qilish: ⬅️ Orqaga",
+        "Bekor qilish: ?? Orqaga",
         reply_markup=withdraw_cancel_inline_keyboard(),
         parse_mode="HTML",
     )
@@ -4035,7 +5342,7 @@ async def withdraw_choose_amount(callback: CallbackQuery, state: FSMContext):
 
     await callback.message.answer(
         "🎮 Endi, almaz yechmoqchi bo'lgan Free Fire akkauntingiz <b>ID raqamini</b> yuboring.\n\n"
-        "ID ni diqqat bilan tekshirib yuboring — almaz aynan shu akkauntga tushiriladi.",
+        'ID ni diqqat bilan tekshirib yuboring — almaz aynan shu akkauntga tushiriladi.',
         parse_mode="HTML",
         reply_markup=withdraw_cancel_inline_keyboard(),
     )
@@ -4049,7 +5356,7 @@ async def withdraw_receive_ff_id(message: Message, state: FSMContext):
     amount = data.get("withdraw_amount")
     ff_id = (message.text or "").strip()
 
-    if ff_id in {"⬅️ Orqaga", "Orqaga"}:
+    if ff_id in {'⬅️ Orqaga', "Orqaga"}:
         await state.clear()
         text = await build_balance_text(message.from_user.id, message.from_user.first_name)
         if text:
@@ -4122,7 +5429,7 @@ async def withdraw_approve(callback: CallbackQuery):
 
     await add_almaz(user_id, -amount)
     await update_withdraw_status(req_id, "approved", callback.from_user.id, None)
-    await update_withdraw_admin_messages(callback.bot, req_id, "✅ Tasdiqlandi")
+    await update_withdraw_admin_messages(callback.bot, req_id, '✅ Tasdiqlandi')
     await log_admin_action(
         admin_id=callback.from_user.id,
         action="WITHDRAW_APPROVED",
@@ -4135,7 +5442,7 @@ async def withdraw_approve(callback: CallbackQuery):
             user_id,
             "🎉 Almaz yechish so'rovingiz tasdiqlandi!\n\n"
             f"💎 Miqdor: <b>{amount} Almaz</b>\n"
-            "Almazingiz Free Fire akkauntingizga muvaffaqiyatli tashlab berildi. Rahmat! 😊",
+            'Almazingiz Free Fire akkauntingizga muvaffaqiyatli tashlab berildi. Rahmat! 😊',
             parse_mode="HTML"
         )
     except Exception:
@@ -4169,7 +5476,7 @@ async def withdraw_reject(callback: CallbackQuery):
         return
 
     await update_withdraw_status(req_id, "rejected", callback.from_user.id, None)
-    await update_withdraw_admin_messages(callback.bot, req_id, "❌ Rad etildi")
+    await update_withdraw_admin_messages(callback.bot, req_id, '❌ Rad etildi')
     await log_admin_action(
         admin_id=callback.from_user.id,
         action="WITHDRAW_REJECTED",
@@ -4223,7 +5530,7 @@ async def withdraw_edit_start(callback: CallbackQuery, state: FSMContext):
     )
 
     await callback.message.answer(
-        "Yangi xabar matnini kiriting. Bekor qilish: ⬅️ Orqaga",
+        "Bekor qilish: ?? Orqaga",
         reply_markup=back_only_keyboard(),
     )
     await callback.answer()
@@ -4234,7 +5541,7 @@ async def withdraw_edit_send(message: Message, state: FSMContext):
     if not await is_owner_or_admin(message.from_user.id):
         return
 
-    if (message.text or "").strip() == "⬅️ Orqaga":
+    if (message.text or "").strip() == '⬅️ Orqaga':
         await state.clear()
         role = await get_admin_role(message.from_user.id)
         await message.answer("Bekor qilindi.", reply_markup=admin_menu_keyboard(role) if role else None)
@@ -4253,7 +5560,7 @@ async def withdraw_edit_send(message: Message, state: FSMContext):
         await message.answer("❌ Matn bo'sh bo'lmasligi kerak.")
         return
     if len(note) > 4096:
-        await message.answer("❌ Matn juda uzun. 4096 belgidan oshmasin.")
+        await message.answer('❌ Matn juda uzun. 4096 belgidan oshmasin.')
         return
 
     req = await get_withdraw_request(int(req_id))
@@ -4282,7 +5589,7 @@ async def withdraw_edit_send(message: Message, state: FSMContext):
         await message.answer("❌ So'rov holatini yangilab bo'lmadi (ehtimol allaqachon qayta ishlangan).")
         return
 
-    await update_withdraw_admin_messages(message.bot, int(req_id), "✅ Status: edited")
+    await update_withdraw_admin_messages(message.bot, int(req_id), '✅ Status: edited')
     await log_admin_action(
         admin_id=message.from_user.id,
         action="WITHDRAW_EDITED",
@@ -4313,12 +5620,12 @@ async def contact_admin_handler(callback: CallbackQuery):
         "SELECT value FROM settings WHERE key = $1",
         "admin_contact_text",
     )
-    text = row["value"] if row else "📞 Admin bilan bog‘lanish uchun admin yozing."
+    text = row["value"] if row else "📞 Admin bilan bog'lanish uchun admin yozing."
 
     await safe_edit(callback, text, reply_markup=prices_back_inline())
     await callback.answer()
 
-@router.message(AdminMenuStates.menu, F.text == "📞 Admin bilan bog‘lanish matni")
+@router.message(AdminMenuStates.menu, F.text == "📞 Admin bilan bog'lanish matni")
 async def admin_edit_contact_text(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
@@ -4327,7 +5634,7 @@ async def admin_edit_contact_text(message: Message, state: FSMContext):
     await state.set_state(AdminContactTextStates.waiting_text)
 
     await message.answer(
-        "✍️ Foydalanuvchilarga chiqadigan ADMIN bilan bog‘lanish matnini yuboring:\n\n"
+        "✍️ Foydalanuvchilarga chiqadigan ADMIN bilan bog'lanish matnini yuboring:\n\n"
         "Markdown ishlatish mumkin.",
         reply_markup=back_only_keyboard()
     )
@@ -4352,7 +5659,7 @@ async def admin_save_main_menu_text(message: Message, state: FSMContext):
         await state.set_state(AdminMenuStates.menu)
         role = await get_admin_role(message.from_user.id)
         await message.answer(
-            "ADMIN PANEL\n\nKerakli bo'limni tanlang:",
+            "🛠 ADMIN PANEL\n\nKerakli bo'limni tanlang:",
             reply_markup=admin_menu_keyboard(role)
         )
         return
@@ -4369,11 +5676,11 @@ async def admin_save_main_menu_text(message: Message, state: FSMContext):
 
 @router.message(AdminContactTextStates.waiting_text)
 async def admin_save_contact_text(message: Message, state: FSMContext):
-    if message.text == "⬅️ Orqaga":
+    if message.text == '⬅️ Orqaga':
         await state.set_state(AdminMenuStates.menu)
         role = await get_admin_role(message.from_user.id)
         await message.answer(
-            "🛠 ADMIN PANEL\n\nKerakli bo‘limni tanlang:",
+            "🛠 ADMIN PANEL\n\nKerakli bo'limni tanlang:",
             reply_markup=admin_menu_keyboard(role)
         )
         return
@@ -4387,7 +5694,7 @@ async def admin_save_contact_text(message: Message, state: FSMContext):
 
     role = await get_admin_role(message.from_user.id)
     await message.answer(
-        "✅ Admin bilan bog‘lanish matni yangilandi",
+        "✅ Admin bilan bog'lanish matni yangilandi",
         reply_markup=admin_menu_keyboard(role)
     )
 
@@ -4413,15 +5720,18 @@ async def voucher_quantity_selected(callback: CallbackQuery, state: FSMContext):
 
     await safe_edit(
         callback,
-        "✅ <b>BUYURTMA MA’LUMOTI</b>\n\n"
-        f"💳 Voucher: {data['name']}\n"
-        f"🧮 Soni: {qty} dona\n"
-        f"💎 Jami almaz: {total_almaz}\n"
-        f"💰 Jami narx: {total_price:,} so‘m\n\n"
-        "⚡ Yetkazish: 5–15 daqiqa\n"
-        "🔒 Xavfsiz va kafolatlangan\n\n"
-        "🆔 <b>Free Fire ID</b> raqamingizni kiriting:\n"
-        "⚠️ <i>Diqqat: noto'g'ri ID jo'natilgan holatlarda Adminga murojaat qilishingiz kerak</i>"
+        '🎯 <b>BUYURTMA TAYYOR</b>\n\n'
+        "Quyida voucher buyurtmangiz ma'lumotlari:\n\n"
+        f"💳 Voucher: <b>{data['name']}</b>\n"
+        f"🧮 Miqdor: <b>{qty} dona</b>\n"
+        f"💎 Jami almaz: <b>{total_almaz}</b>\n"
+        f"💰 Jami narx: <b>{total_price:,} so'm</b>\n\n"
+        '⚡ Yetkazish vaqti: <b>5–35 daqiqa</b>\n'
+        '🛡 Buyurtma admin tomonidan tekshiriladi\n'
+        "🔒 To'lov jarayoni xavfsiz va nazorat ostida\n\n"
+        '🎮 <b>Endi Free Fire ID raqamingizni kiriting</b>\n'
+        "Shu ID ga almaz yuboriladi.\n\n"
+        '⚠️ <i>Iltimos, ID ni diqqat bilan tekshirib yuboring.</i>'
     )
 
 
@@ -4451,27 +5761,27 @@ async def buy_voucher_handler(callback: CallbackQuery, state: FSMContext):
     )
 
     if not rows:
-        await callback.answer("❌ Voucherlar mavjud emas", show_alert=True)
+        await callback.answer('❌ Voucherlar mavjud emas', show_alert=True)
         return
 
     keyboard = []
     for v in rows:
         keyboard.append([
             InlineKeyboardButton(
-                text=f"{v['id']}. {v['name']} — {v['price']:,} so‘m",
+                text=f"{v['id']}. {v['name']} — {v['price']:,} so'm",
                 callback_data=f"voucher:{v['id']}"
             )
         ])
 
     keyboard.append([
-        InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back_to_menu")
+        InlineKeyboardButton(text='⬅️ Orqaga', callback_data="back_to_menu")
     ])
 
     await safe_edit(
         callback,
-        "💳 Kerakli voucherni tanlang.\n\n"
+        '💳 Kerakli voucherni tanlang.\n\n'
 
-        "🎮 Mos keladi • ⚡ Tez ishlaydi • 🔒 Xavfsiz",
+        '🎮 Mos keladi • ⚡ Tez ishlaydi • 🔒 Xavfsiz',
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard)
     )
     await callback.answer()
@@ -4486,12 +5796,12 @@ async def voucher_selected_handler(callback: CallbackQuery, state: FSMContext):
     )
 
     if not voucher:
-        await callback.answer("❌ Voucher topilmadi", show_alert=True)
+        await callback.answer('❌ Voucher topilmadi', show_alert=True)
         return
 
     name, almaz, price = voucher["name"], voucher["almaz"], voucher["price"]
 
-    # voucher ma’lumotlarini state’ga saqlaymiz
+    # voucher ma'lumotlarini state'ga saqlaymiz
     await state.update_data(
         is_voucher=True,
         voucher_id=voucher_id,
@@ -4506,8 +5816,8 @@ async def voucher_selected_handler(callback: CallbackQuery, state: FSMContext):
         callback,
         f"{name}\n\n"
         f"💎 {almaz} almaz / 1 dona\n"
-        f"💰 {price:,} so‘m / 1 dona\n\n"
-        "🧮 Nechta dona olmoqchisiz?",
+        f"💰 {price:,} so'm / 1 dona\n\n"
+        '🧮 Nechta dona olmoqchisiz?',
         reply_markup=voucher_quantity_keyboard(voucher_id)
     )
     await callback.answer()
@@ -4518,7 +5828,7 @@ async def admin_order_detail(message: Message, state: FSMContext):
     if not role:
         return
 
-    if message.text == "⬅️ Orqaga":
+    if message.text == '⬅️ Orqaga':
         await state.set_state(AdminMenuStates.menu)
         role = await get_admin_role(message.from_user.id)
         await message.answer(
@@ -4528,7 +5838,7 @@ async def admin_order_detail(message: Message, state: FSMContext):
         return
 
     if not message.text.isdigit():
-        await message.answer("❌ Iltimos, BUYURTMA ID raqamini kiriting")
+        await message.answer('❌ Iltimos, BUYURTMA ID raqamini kiriting')
         return
 
     order_id = int(message.text)
@@ -4559,7 +5869,7 @@ async def admin_order_detail(message: Message, state: FSMContext):
     )
 
     if not order:
-        await message.answer("❌ Buyurtma topilmadi")
+        await message.answer('❌ Buyurtma topilmadi')
         return
 
     formatted_date = format_dt_utc5(order["created_at"])
@@ -4567,7 +5877,7 @@ async def admin_order_detail(message: Message, state: FSMContext):
     rejected_at = format_dt_utc5(order["rejected_at"])
     bonus_percent = (order["bonus_percent_bp"] or 0) / 100
 
-    username = order["username"] or "yo‘q"
+    username = order["username"] or "yo'q"
     text = (
         f"🧾 <b>BUYURTMA #{order['id']}</b>\n\n"
         f"👤 <b>User:</b> {order['first_name']} (@{username})\n"
@@ -4575,7 +5885,7 @@ async def admin_order_detail(message: Message, state: FSMContext):
         f"📦 <b>Mahsulot:</b> {order['product_name']}\n"
         f"💎 <b>Almaz:</b> {order['almaz']}\n"
         f"🧮 <b>Soni:</b> {order['quantity']}\n"
-        f"💰 <b>Narx:</b> {order['price']:,} so‘m\n\n"
+        f"💰 <b>Narx:</b> {order['price']:,} so'm\n\n"
         f"🎮 <b>FF ID:</b> {order['ff_id']}\n"
         f"📌 <b>Holat:</b> {order['status']}\n"
         f"🕒 <b>Sana:</b> {formatted_date}\n"
@@ -4589,7 +5899,7 @@ async def admin_order_detail(message: Message, state: FSMContext):
 
 
 
-@router.message(AdminMenuStates.menu, F.text == "🪵 Admin loglari")
+@router.message(AdminMenuStates.menu, F.text == '🪵 Admin loglari')
 async def admin_logs_view(message: Message):
     role = await require_role(message, (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN, ADMIN_ROLE_VIEWER))
     if not role:
@@ -4605,10 +5915,10 @@ async def admin_logs_view(message: Message):
     )
 
     if not logs:
-        await message.answer("🪵 Loglar hozircha yo‘q")
+        await message.answer("🪵 Loglar hozircha yo'q")
         return
 
-    text = "🪵 ADMIN LOGI (oxirgi 15)\n\n"
+    text = '🪵 ADMIN LOGI (oxirgi 15)\n\n'
 
     for row in logs:
         admin_id = row["admin_id"]
@@ -4639,12 +5949,12 @@ async def cancel_process_handler(callback: CallbackQuery, state: FSMContext):
 
     await state.clear()
 
-    await callback.message.answer("❌ Xarid jarayoni bekor qilindi.")
+    await callback.message.answer('❌ Xarid jarayoni bekor qilindi.')
     await show_main_menu_callback(callback)
     await callback.answer("Jarayon bekor qilindi")
 
 
-@router.message(AdminMenuStates.menu, F.text == "🔍 Foydalanuvchini topish")
+@router.message(AdminMenuStates.menu, F.text == '🔍 Foydalanuvchini topish')
 async def admin_user_search_start(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER, ADMIN_ROLE_MAIN, ADMIN_ROLE_VIEWER))
     if not role:
@@ -4653,14 +5963,14 @@ async def admin_user_search_start(message: Message, state: FSMContext):
     await state.set_state(AdminUserSearchStates.waiting_query)
 
     await message.answer(
-        "🔍 <b>FOYDALANUVCHINI TOPISH</b>\n\n"
+        '🔍 <b>FOYDALANUVCHINI TOPISH</b>\n\n'
         "Telegram ID yoki @username yuboring:",
         reply_markup=user_search_back_keyboard()
     )
 
 @router.message(AdminUserSearchStates.waiting_query)
 async def admin_user_search_handler(message: Message, state: FSMContext):
-    if message.text == "⬅️ Orqaga":
+    if message.text == '⬅️ Orqaga':
         await state.set_state(AdminMenuStates.menu)
         role = await get_admin_role(message.from_user.id)
         await message.answer(
@@ -4688,7 +5998,7 @@ async def admin_user_search_handler(message: Message, state: FSMContext):
         )
 
     if not user:
-        await message.answer("❌ Foydalanuvchi topilmadi")
+        await message.answer('❌ Foydalanuvchi topilmadi')
         return
 
     (
@@ -4738,14 +6048,14 @@ async def admin_user_search_handler(message: Message, state: FSMContext):
     text = (
         f"👤 <b>FOYDALANUVCHI PROFILI</b>\n\n"
         f"👤 Ism: {first_name}\n"
-        f"🔗 Username: @{username if username else 'yo‘q'}\n"
+        f"🔗 Username: @{username if username else "yo'q"}\n"
         f"🆔 Telegram ID: {user_id}\n"
         f"📅 Botga kirgan: {joined_dt}\n\n"
         f"📊 <b>STATISTIKA</b>\n"
         f"🧾 Jami buyurtmalar: {total_orders}\n"
         f"✅ Tasdiqlangan: {approved_orders}\n"
         f"❌ Rad etilgan: {rejected_orders}\n"
-        f"💰 Jami sarflangan: {total_spent:,} so‘m\n\n"
+        f"💰 Jami sarflangan: {total_spent:,} so'm\n\n"
         f"💎 <b>BALANS</b>\n"
         f"💎 Joriy: {almaz_balance}\n"
         f"🎁 Bonus: {bonus_almaz}\n"
@@ -4753,18 +6063,18 @@ async def admin_user_search_handler(message: Message, state: FSMContext):
     )
 
     if last_orders:
-        text += "\n📦 <b>OXIRGI 5 SOTIB OLINGAN</b>\n"
+        text += '\n📦 <b>OXIRGI 5 SOTIB OLINGAN</b>\n'
         for row in last_orders:
             name = row["product_name"]
             almaz = row["almaz"]
             price = row["price"]
             created_at = row["created_at"]
             date_fmt = format_dt_utc5(created_at).split(" | ")[0]
-            text += f"• {name} | 💎 {almaz} | 💰 {price:,} so‘m | {date_fmt}\n"
+            text += f"• {name} | 💎 {almaz} | 💰 {price:,} so'm | {date_fmt}\n"
 
     await message.answer(text)
 
-@router.message(AdminMenuStates.menu, F.text == "💳 Voucherlar")
+@router.message(AdminMenuStates.menu, F.text == '💳 Voucherlar')
 async def admin_vouchers_menu(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
@@ -4773,7 +6083,7 @@ async def admin_vouchers_menu(message: Message, state: FSMContext):
     await push_nav(state, "admin_vouchers")
     await show_admin_vouchers_menu(message, state)
 
-@router.message(AdminVouchersStates.menu, F.text == "✏️ Voucher tahrirlash")
+@router.message(AdminVouchersStates.menu, F.text == '✏️ Voucher tahrirlash')
 async def admin_edit_voucher_start(message: Message, state: FSMContext):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
@@ -4795,12 +6105,12 @@ async def admin_edit_voucher_start(message: Message, state: FSMContext):
     )
 
     if not vouchers:
-        await message.answer("❌ Voucherlar topilmadi")
+        await message.answer('❌ Voucherlar topilmadi')
         return
 
-    text = "✏️ Tahrirlash uchun voucher RAQAMINI yuboring:\n\n"
+    text = '✏️ Tahrirlash uchun voucher RAQAMINI yuboring:\n\n'
     for v in vouchers:
-        text += f"{v['id']}. {v['name']} — {v['price']:,} so‘m\n"
+        text += f"{v['id']}. {v['name']} — {v['price']:,} so'm\n"
 
     await state.set_state(AdminVouchersStates.edit_select)
     await message.answer(text)
@@ -4812,7 +6122,7 @@ async def admin_edit_voucher_choose(message: Message, state: FSMContext):
         return
 
     if not message.text.isdigit():
-        await message.answer("❌ Voucher ID raqam bo‘lishi kerak")
+        await message.answer("❌ Voucher ID raqam bo'lishi kerak")
         return
 
     voucher_id = int(message.text)
@@ -4822,17 +6132,17 @@ async def admin_edit_voucher_choose(message: Message, state: FSMContext):
         voucher_id,
     )
     if not row:
-        await message.answer("❌ Voucher topilmadi")
+        await message.answer('❌ Voucher topilmadi')
         return
 
     await state.update_data(voucher_id=voucher_id)
     await state.set_state(AdminVouchersStates.edit_field)
 
     await message.answer(
-        "Qaysi maydonni o‘zgartiramiz?\n\n"
-        "1 — Nomi\n"
-        "2 — Almaz miqdori\n"
-        "3 — Narxi"
+        "Qaysi maydonni o'zgartiramiz?\n\n"
+        '1 — Nomi\n'
+        '2 — Almaz miqdori\n'
+        '3 — Narxi'
     )
 
 @router.message(AdminVouchersStates.edit_field)
@@ -4842,7 +6152,7 @@ async def admin_edit_voucher_field(message: Message, state: FSMContext):
         return
 
     if message.text not in ["1", "2", "3"]:
-        await message.answer("❌ 1, 2 yoki 3 ni tanlang")
+        await message.answer('❌ 1, 2 yoki 3 ni tanlang')
         return
 
     field_map = {
@@ -4854,7 +6164,7 @@ async def admin_edit_voucher_field(message: Message, state: FSMContext):
     await state.update_data(field=field_map[message.text])
     await state.set_state(AdminVouchersStates.edit_value)
 
-    await message.answer("✍️ Yangi qiymatni kiriting:")
+    await message.answer('✍️ Yangi qiymatni kiriting:')
 
 @router.message(AdminVouchersStates.edit_value)
 async def admin_edit_voucher_save(message: Message, state: FSMContext):
@@ -4871,13 +6181,13 @@ async def admin_edit_voucher_save(message: Message, state: FSMContext):
     if field not in allowed_fields:
         await state.set_state(AdminVouchersStates.menu)
         await message.answer(
-            "❌ Noto‘g‘ri maydon tanlangan. Qaytadan urinib ko‘ring.",
+            "❌ Noto'g'ri maydon tanlangan. Qaytadan urinib ko'ring.",
             reply_markup=admin_vouchers_menu_keyboard(),
         )
         return
 
     if not value_raw:
-        await message.answer("❌ Qiymat bo‘sh bo‘lishi mumkin emas")
+        await message.answer("❌ Qiymat bo'sh bo'lishi mumkin emas")
         return
 
     current = await db.fetchrow(
@@ -4887,7 +6197,7 @@ async def admin_edit_voucher_save(message: Message, state: FSMContext):
     if not current:
         await state.set_state(AdminVouchersStates.menu)
         await message.answer(
-            "❌ Voucher topilmadi yoki nofaol.",
+            '❌ Voucher topilmadi yoki nofaol.',
             reply_markup=admin_vouchers_menu_keyboard(),
         )
         return
@@ -4918,7 +6228,7 @@ async def admin_edit_voucher_save(message: Message, state: FSMContext):
             ),
         )
         await message.answer(
-            "❌ Voucher yangilanmadi. Qiymat formatini tekshiring va qaytadan urinib ko‘ring."
+            "❌ Voucher yangilanmadi. Qiymat formatini tekshiring va qaytadan urinib ko'ring."
         )
         return
 
@@ -4942,7 +6252,7 @@ async def admin_edit_voucher_save(message: Message, state: FSMContext):
 
     await message.answer(
         (
-            "✅ Voucher muvaffaqiyatli yangilandi\n"
+            '✅ Voucher muvaffaqiyatli yangilandi\n'
             f"Maydon: {field}\n"
             f"Oldin: {old_fmt}\n"
             f"Yangi: {new_fmt}"
@@ -4951,17 +6261,17 @@ async def admin_edit_voucher_save(message: Message, state: FSMContext):
     )
 
 
-@router.message(AdminVouchersStates.edit_select, F.text == "⬅️ Orqaga")
-@router.message(AdminVouchersStates.edit_field, F.text == "⬅️ Orqaga")
-@router.message(AdminVouchersStates.edit_value, F.text == "⬅️ Orqaga")
+@router.message(AdminVouchersStates.edit_select, F.text == '⬅️ Orqaga')
+@router.message(AdminVouchersStates.edit_field, F.text == '⬅️ Orqaga')
+@router.message(AdminVouchersStates.edit_value, F.text == '⬅️ Orqaga')
 async def admin_vouchers_edit_back(message: Message, state: FSMContext):
     await state.set_state(AdminVouchersStates.menu)
     await message.answer(
-        "💳 VOUCHERLAR BOSHQARUVI",
+        '💳 VOUCHERLAR BOSHQARUVI',
         reply_markup=admin_vouchers_menu_keyboard()
     )
 
-@router.message(AdminVouchersStates.menu, F.text == "⬅️ Orqaga")
+@router.message(AdminVouchersStates.menu, F.text == '⬅️ Orqaga')
 async def admin_vouchers_back(message: Message, state: FSMContext):
     await state.set_state(AdminMenuStates.menu)
 
@@ -4992,7 +6302,7 @@ async def admin_vouchers_menu_fallback(message: Message, state: FSMContext):
         return
 
 async def reminder_worker(bot):
-    print("🔔 Reminder worker ishga tushdi")
+    print("?? Reminder worker ishga tushdi")
 
     while True:
         try:
@@ -5018,14 +6328,14 @@ async def reminder_worker(bot):
                     if r_type == "voucher":
                         text = (
                             "💳 <b>Bugun voucher sotib olishni unutdingizmi?</b>\n\n"
-                            "⏳ Aksiyalar cheklangan.\n"
-                            "🎁 Qulay paytda davom etishingiz mumkin."
+                            '⏱ Aksiyalar cheklangan.\n'
+                            '🎁 Qulay paytda davom etishingiz mumkin.'
                         )
                     else:
                         text = (
                             "💎 <b>Bugun almaz sotib olishni unutdingizmi?</b>\n\n"
-                            "🎮 Free Fire sizni kutyapti!\n"
-                            "⚡ 5–60 daqiqada yetkazib beramiz."
+                            '🎮 Free Fire sizni kutyapti!\n'
+                            '⚡ 5–60 daqiqada yetkazib beramiz.'
                         )
 
                     await bot.send_message(user_id, text)
@@ -5035,10 +6345,10 @@ async def reminder_worker(bot):
                         reminder_id,
                     )
 
-                    print(f"✅ Reminder yuborildi → user {user_id}")
+                    print(f"✅ Reminder yuborildi -> user {user_id}")
 
                 except Exception as e:
-                    print("❌ Reminder yuborishda xato:", e)
+                    print('❌ Reminder yuborishda xato:', e)
 
                     await db.execute(
                         "UPDATE reminders SET sent = TRUE WHERE id = $1",
@@ -5046,13 +6356,13 @@ async def reminder_worker(bot):
                     )
 
         except Exception as e:
-            print("❌ Reminder worker error:", e)
+            print('❌ Reminder worker error:', e)
 
-        await asyncio.sleep(10)  # 🔥 TEST UCHUN 10 SONIYA
+        await asyncio.sleep(10)  # TEST UCHUN 10 SONIYA
 
 
 async def bonus_code_worker(bot):
-    print("🎁 Bonus code worker ishga tushdi")
+    print("?? Bonus code worker ishga tushdi")
 
     while True:
         try:
@@ -5079,17 +6389,17 @@ async def bonus_code_worker(bot):
                 try:
                     await bot.send_message(
                         row["owner_id"],
-                        "⏰ <b>BONUS KOD MUDDATI TUGADI</b>\n\n"
+                        '⏰ <b>BONUS KOD MUDDATI TUGADI</b>\n\n'
                         f"🎁 Kod: <code>{row['code']}</code>\n"
                         f"👥 Ishlatilgan: {row['total_uses']} ta\n"
                         f"💎 Jami bonus: {row['total_bonus']} 💎\n\n"
-                        "✅ Endi yangi kod yaratishingiz mumkin."
+                        '✅ Endi yangi kod yaratishingiz mumkin.'
                     )
                 except Exception:
                     pass
 
         except Exception as e:
-            print("❌ Bonus code worker error:", e)
+            print('❌ Bonus code worker error:', e)
 
         await asyncio.sleep(60)
 
@@ -5099,11 +6409,11 @@ async def enter_promocode_handler(callback: CallbackQuery, state: FSMContext):
 
     await safe_edit(
         callback,
-        "🎁 <b>PROMOKOD KIRITISH</b>\n\n"
-        "Promokod — bu bonus almaz olish imkoniyati.\n"
-        "To‘g‘ri promokod kiritilsa, balansingizga "
-        "qo‘shimcha 💎 bonus beriladi.\n\n"
-        "✍️ <b>Promokod so‘zini kiriting</b>\n"
+        '🎁 <b>PROMOKOD KIRITISH</b>\n\n'
+        'Promokod — bu bonus almaz olish imkoniyati.\n'
+        "To'g'ri promokod kiritilsa, balansingizga "
+        "qo'shimcha 💎 bonus beriladi.\n\n"
+        "✍️ <b>Promokod so'zini kiriting</b>\n"
         "Masalan: <code>ZONIKSBB</code>",
         reply_markup=promocode_back_to_menu_keyboard()
     )
@@ -5126,8 +6436,8 @@ async def apply_promocode_handler(message: Message, state: FSMContext):
 
     if promo_used >= 3:
         await message.answer(
-            "⚠️ Siz juda ko‘p promokod ishlatgansiz.\n\n"
-            "Keyingi promokodlardan foydalanish uchun xarid qilish kerak bo‘ladi."
+            "⚠️ Siz juda ko'p promokod ishlatgansiz.\n\n"
+            "Keyingi promokodlardan foydalanish uchun xarid qilish kerak bo'ladi."
         )
         return
 
@@ -5142,7 +6452,7 @@ async def apply_promocode_handler(message: Message, state: FSMContext):
     )
 
     if not promo:
-        await message.answer("❌ Bunday promokod mavjud emas")
+        await message.answer('❌ Bunday promokod mavjud emas')
         return
 
     promo_id = promo["id"]
@@ -5153,15 +6463,15 @@ async def apply_promocode_handler(message: Message, state: FSMContext):
     active = promo["active"]
 
     if not active:
-        await message.answer("⛔ Bu promokod faol emas")
+        await message.answer('⛔ Bu promokod faol emas')
         return
 
     if expires_at and now > expires_at:
-        await message.answer("⏰ Promokod muddati tugagan")
+        await message.answer('⏰ Promokod muddati tugagan')
         return
 
     if used_count >= max_uses:
-        await message.answer("😔 Afsus, promokod limiti tugagan")
+        await message.answer('😔 Afsus, promokod limiti tugagan')
         return
 
     # 👤 USER OLDIN ISHLATGANMI?
@@ -5171,10 +6481,10 @@ async def apply_promocode_handler(message: Message, state: FSMContext):
         user_id,
     )
     if row:
-        await message.answer("⚠️ Siz bu promokodni allaqachon ishlatgansiz")
+        await message.answer('⚠️ Siz bu promokodni allaqachon ishlatgansiz')
         return
 
-    # ✅ HAMMASI TO‘G‘RI — ALMAZ QO‘SHAMIZ
+    # ✅ HAMMASI TO'G'RI — ALMAZ QO'SHAMIZ
     await db.execute(
         """
         UPDATE users
@@ -5211,12 +6521,12 @@ async def apply_promocode_handler(message: Message, state: FSMContext):
 
     await message.answer(
         f"🎉 <b>PROMOKOD MUVAFFAQIYATLI!</b>\n\n"
-        f"🎁 +{almaz} 💎 almaz balansingizga qo‘shildi\n"
+        f"🎁 +{almaz} 💎 almaz balansingizga qo'shildi\n"
         f"🔥 Balansingiz yangilandi!"
     )
 
 
-@router.message(AdminPromoStates.menu, F.text == "📊 Promokodlar ro‘yxati")
+@router.message(AdminPromoStates.menu, F.text == "📊 Promokodlar ro'yxati")
 async def admin_promo_list(message: Message):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
@@ -5233,10 +6543,10 @@ async def admin_promo_list(message: Message):
     )
 
     if not rows:
-        await message.answer("📭 Promokodlar yo‘q")
+        await message.answer("📭 Promokodlar yo'q")
         return
 
-    text = "📊 <b>PROMOKODLAR</b>\n\n"
+    text = '📊 <b>PROMOKODLAR</b>\n\n'
 
     for row in rows:
         code = row["code"]
@@ -5246,11 +6556,11 @@ async def admin_promo_list(message: Message):
         is_deleted = row["is_deleted"]
         expires_at = row["expires_at"]
         if is_deleted:
-            status = "❌ DELETED"
+            status = '❌ DELETED'
         elif expires_at and utc_now() > expires_at:
-            status = "⏰ EXPIRED"
+            status = '⏰ EXPIRED'
         else:
-            status = "🟢 ACTIVE" if active else "🔴 OFF"
+            status = '🟢 ACTIVE' if active else '🔴 OFF'
         text += (
             f"{status}\n"
             f"🎁 {code}\n"
@@ -5260,7 +6570,7 @@ async def admin_promo_list(message: Message):
 
     buttons = []
     for row in rows:
-        buttons.append([InlineKeyboardButton(text=f"❌ O‘chirish {row['code']}", callback_data=f"promo_del:{row['code']}")])
+        buttons.append([InlineKeyboardButton(text=f"❌ O'chirish {row['code']}", callback_data=f"promo_del:{row['code']}")])
 
     await message.answer(
         text,
@@ -5268,7 +6578,7 @@ async def admin_promo_list(message: Message):
     )
 
 
-@router.message(AdminPromoStates.menu, F.text == "⬅️ Orqaga")
+@router.message(AdminPromoStates.menu, F.text == '⬅️ Orqaga')
 async def admin_promo_back(message: Message, state: FSMContext):
     await state.set_state(AdminMenuStates.menu)
     role = await get_admin_role(message.from_user.id)
@@ -5281,19 +6591,19 @@ async def admin_promo_back(message: Message, state: FSMContext):
 async def admin_promocode_delete_prompt(callback: CallbackQuery):
     role = await get_admin_role(callback.from_user.id)
     if role not in (ADMIN_ROLE_SUPER,):
-        await callback.answer("⛔ Sizda ruxsat yo‘q", show_alert=True)
+        await callback.answer("⛔ Sizda ruxsat yo'q", show_alert=True)
         return
     code = callback.data.split(":", 1)[1].strip().upper()
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Ha, o‘chirish", callback_data=f"promo_del_yes:{code}"),
-                InlineKeyboardButton(text="❌ Bekor qilish", callback_data=f"promo_del_no:{code}"),
+                InlineKeyboardButton(text="✅ Ha, o'chirish", callback_data=f"promo_del_yes:{code}"),
+                InlineKeyboardButton(text='❌ Bekor qilish', callback_data=f"promo_del_no:{code}"),
             ]
         ]
     )
     await callback.message.answer(
-        f"Rostdan ham <b>{code}</b> promokodni o‘chirmoqchimisiz?",
+        f"Rostdan ham <b>{code}</b> promokodni o'chirmoqchimisiz?",
         reply_markup=kb
     )
     await callback.answer()
@@ -5303,14 +6613,14 @@ async def admin_promocode_delete_prompt(callback: CallbackQuery):
 async def admin_promocode_delete_confirm(callback: CallbackQuery):
     role = await get_admin_role(callback.from_user.id)
     if role not in (ADMIN_ROLE_SUPER,):
-        await callback.answer("⛔ Sizda ruxsat yo‘q", show_alert=True)
+        await callback.answer("⛔ Sizda ruxsat yo'q", show_alert=True)
         return
     code = callback.data.split(":", 1)[1].strip().upper()
     await db.execute(
         "UPDATE promocodes SET is_deleted = TRUE, active = FALSE WHERE code = $1",
         code,
     )
-    await callback.message.answer(f"⛔ Promokod <b>{code}</b> o‘chirildi")
+    await callback.message.answer(f"⛔ Promokod <b>{code}</b> o'chirildi")
     await callback.answer()
 
 
@@ -5319,13 +6629,13 @@ async def admin_promocode_delete_cancel(callback: CallbackQuery, state: FSMConte
     await callback.answer("Bekor qilindi")
     await admin_promo_list(callback.message)
 
-@router.message(AdminPromoStates.menu, F.text.startswith("👥 Kim ishlatdi "))
+@router.message(AdminPromoStates.menu, F.text.startswith('👥 Kim ishlatdi '))
 async def admin_promo_users(message: Message):
     role = await require_role(message, (ADMIN_ROLE_SUPER,))
     if not role:
         return
 
-    code = message.text.replace("👥 Kim ishlatdi ", "").strip().upper()
+    code = message.text.replace('👥 Kim ishlatdi ', "").strip().upper()
 
     rows = await db.fetch(
         """
@@ -5340,7 +6650,7 @@ async def admin_promo_users(message: Message):
     )
 
     if not rows:
-        await message.answer("📭 Hech kim ishlatmagan")
+        await message.answer('📭 Hech kim ishlatmagan')
         return
 
     text = f"👥 <b>{code}</b> promokodini ishlatganlar:\n\n"
@@ -5356,64 +6666,64 @@ async def admin_promo_users(message: Message):
     await message.answer(text)
 
 BONUS_CODE_HELP_TEXT = (
-    "📘 <b>BONUSLI KOD — TO‘LIQ QO‘LLANMA</b>\n\n"
+    "📘 <b>BONUSLI KOD — TO'LIQ QO'LLANMA</b>\n\n"
 
-    "Bonusli kod tizimi sizga do‘stlaringiz bilan birga "
+    "Bonusli kod tizimi sizga do'stlaringiz bilan birga "
     "foydaliroq donat qilish imkonini beradi.\n"
     "Tizim oddiy, shaffof va avtomatik ishlaydi.\n\n"
 
-    "━━━━━━━━━━━━━━\n"
-    "👤 <b>1-QADAM. BONUS KOD YARATISH</b>\n"
-    "━━━━━━━━━━━━━━\n"
-    "• «🎁 Kod yaratishВ» tugmasini bosing\n"
-    "• Sizga maxsus bonus kod beriladi\n"
-    "• Har bir foydalanuvchida faqat 1 ta aktiv kod bo‘ladi\n"
-    "• Kod 4 kun davomida amal qiladi\n\n"
+    '━━━━━━━━━━━━━━\n'
+    '👤 <b>1-QADAM. BONUS KOD YARATISH</b>\n'
+    '━━━━━━━━━━━━━━\n'
+    '• «🎁 Kod yaratishВ» tugmasini bosing\n'
+    '• Sizga maxsus bonus kod beriladi\n'
+    "• Har bir foydalanuvchida faqat 1 ta aktiv kod bo'ladi\n"
+    '• Kod 4 kun davomida amal qiladi\n\n'
 
-    "━━━━━━━━━━━━━━\n"
-    "🤝 <b>2-QADAM. KODNI DO‘STLARGA BERISH</b>\n"
-    "━━━━━━━━━━━━━━\n"
-    "• Yaratilgan kodni do‘stlaringizga yuboring\n"
-    "• Do‘stlaringiz «📥 Kod ishlatishВ» tugmasi orqali kodni kiritadi\n"
-    "• Shundan so‘ng ular odatdagidek paket yoki voucher sotib olishadi\n\n"
+    '━━━━━━━━━━━━━━\n'
+    "🤝 <b>2-QADAM. KODNI DO'STLARGA BERISH</b>\n"
+    '━━━━━━━━━━━━━━\n'
+    "• Yaratilgan kodni do'stlaringizga yuboring\n"
+    "• Do'stlaringiz «📥 Kod ishlatishВ» tugmasi orqali kodni kiritadi\n"
+    "• Shundan so'ng ular odatdagidek paket yoki voucher sotib olishadi\n\n"
 
-    "━━━━━━━━━━━━━━\n"
-    "🎁 <b>3-QADAM. BONUS OLISH</b>\n"
-    "━━━━━━━━━━━━━━\n"
-    "• Do‘stingiz xarid qilgach, u bonus oladi\n"
-    "• Siz ham har bir xariddan bonus olasiz\n"
-    "• Bir kod qancha ko‘p ishlatilsa, bonus foizi shuncha foydaliroq bo‘ladi\n\n"
+    '━━━━━━━━━━━━━━\n'
+    '🎁 <b>3-QADAM. BONUS OLISH</b>\n'
+    '━━━━━━━━━━━━━━\n'
+    "• Do'stingiz xarid qilgach, u bonus oladi\n"
+    '• Siz ham har bir xariddan bonus olasiz\n'
+    "• Bir kod qancha ko'p ishlatilsa, bonus foizi shuncha foydaliroq bo'ladi\n\n"
 
-    "━━━━━━━━━━━━━━\n"
-    "📈 <b>BONUS QANDAY HISOBLANADI?</b>\n"
-    "━━━━━━━━━━━━━━\n"
-    "• Bonus foizi foydalanish soniga qarab oshib boradi\n"
-    "• Bonus almaz sifatida balansga qo‘shiladi\n"
-    "• Bonuslar avtomatik va xatosiz hisoblanadi\n\n"
+    '━━━━━━━━━━━━━━\n'
+    '📈 <b>BONUS QANDAY HISOBLANADI?</b>\n'
+    '━━━━━━━━━━━━━━\n'
+    '• Bonus foizi foydalanish soniga qarab oshib boradi\n'
+    "• Bonus almaz sifatida balansga qo'shiladi\n"
+    '• Bonuslar avtomatik va xatosiz hisoblanadi\n\n'
 
-    "━━━━━━━━━━━━━━\n"
-    "🔁 <b>BONUS SIKLI</b>\n"
-    "━━━━━━━━━━━━━━\n"
-    "• Bonuslar 5 kunlik sikl asosida ishlaydi\n"
-    "• 5 kun o‘tgach, hisob qaytadan boshlanadi\n"
-    "• Bu sizga doimiy bonus yig‘ish imkonini beradi\n\n"
+    '━━━━━━━━━━━━━━\n'
+    '🔁 <b>BONUS SIKLI</b>\n'
+    '━━━━━━━━━━━━━━\n'
+    '• Bonuslar 5 kunlik sikl asosida ishlaydi\n'
+    "• 5 kun o'tgach, hisob qaytadan boshlanadi\n"
+    "• Bu sizga doimiy bonus yig'ish imkonini beradi\n\n"
 
-    "━━━━━━━━━━━━━━\n"
-    "🔒 <b>MUHIM QOIDALAR</b>\n"
-    "━━━━━━━━━━━━━━\n"
-    "• O‘zingiz yaratgan kodni o‘zingiz ishlata olmaysiz\n"
-    "• Har bir xarid real va avtomatik tekshiriladi\n"
-    "• Kod faqat faol bo‘lgan vaqtda ishlaydi\n"
-    "• Barcha jarayon shaffof va adolatli\n\n"
+    '━━━━━━━━━━━━━━\n'
+    '🔒 <b>MUHIM QOIDALAR</b>\n'
+    '━━━━━━━━━━━━━━\n'
+    "• O'zingiz yaratgan kodni o'zingiz ishlata olmaysiz\n"
+    '• Har bir xarid real va avtomatik tekshiriladi\n'
+    "• Kod faqat faol bo'lgan vaqtda ishlaydi\n"
+    '• Barcha jarayon shaffof va adolatli\n\n'
 
-    "━━━━━━━━━━━━━━\n"
+    '━━━━━━━━━━━━━━\n'
     "💡 <b>NIMA YUTASIZ?</b>\n"
-    "━━━━━━━━━━━━━━\n"
-    "• Arzonroq donat\n"
-    "• Qo‘shimcha bonus almazlar\n"
-    "• Do‘stlaringiz uchun ham foyda\n\n"
+    '━━━━━━━━━━━━━━\n'
+    '• Arzonroq donat\n'
+    "• Qo'shimcha bonus almazlar\n"
+    "• Do'stlaringiz uchun ham foyda\n\n"
 
-    "<b>Bu shunchaki aksiya emas — bu foydali tizim.</b>"
+    '<b>Bu shunchaki aksiya emas — bu foydali tizim.</b>'
 )
 
 
@@ -5424,7 +6734,7 @@ async def bonus_code_help_handler(callback: CallbackQuery):
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="⬅️ Orqaga",
+                    text='⬅️ Orqaga',
                     callback_data="bonus_code_menu"
                 )
             ]
@@ -5441,11 +6751,12 @@ async def bonus_code_help_handler(callback: CallbackQuery):
 @router.callback_query(F.data == "back_to_main_menu")
 async def back_to_main_menu_handler(callback: CallbackQuery, state: FSMContext):
     await state.clear()
+    text = await get_main_menu_text()
 
     await safe_edit(
         callback,
-        MAIN_MENU_TEXT,
-        reply_markup=main_menu_keyboard()
+        text,
+        reply_markup=await build_main_menu_reply_markup()
     )
 
     await callback.answer()

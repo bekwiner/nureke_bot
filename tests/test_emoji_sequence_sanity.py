@@ -30,6 +30,7 @@ def _is_emojiish(ch: str) -> bool:
         "7",
         "8",
         "9",
+        "\u2139",
     }:
         return True
     return False
