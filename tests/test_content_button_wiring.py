@@ -17,6 +17,12 @@ class ContentButtonWiringTests(unittest.TestCase):
         self.assertIn("Admin qo'shish", source)
         self.assertIn("Admin o'chirish", source)
 
+    def test_package_and_promocode_menus_use_handler_matching_labels(self):
+        source = Path("keyboards.py").read_text(encoding="utf-8")
+        self.assertIn("Paket qo'shish", source)
+        self.assertIn("Paket o'chirish", source)
+        self.assertIn("Promokodlar ro'yxati", source)
+
     def test_schema_and_handlers_exist(self):
         database_source = Path("database.py").read_text(encoding="utf-8")
         handlers_source = Path("handlers.py").read_text(encoding="utf-8")
@@ -35,6 +41,11 @@ class ContentButtonWiringTests(unittest.TestCase):
     def test_help_button_branch_checks_yordam_text(self):
         handlers_source = Path("handlers.py").read_text(encoding="utf-8")
         self.assertIn('"yordam" in norm', handlers_source)
+
+    def test_command_handlers_include_help_and_balance(self):
+        handlers_source = Path("handlers.py").read_text(encoding="utf-8")
+        self.assertIn('Command(commands=["help", "Help"])', handlers_source)
+        self.assertIn('Command(commands=["balance", "Balance"])', handlers_source)
 
 
 if __name__ == "__main__":

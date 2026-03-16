@@ -241,9 +241,9 @@ def dynamic_packages_keyboard(packages: list):
 def admin_packages_menu_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="➕ Paket qo‘shish")],
+            [KeyboardButton(text="➕ Paket qo'shish")],
             [KeyboardButton(text="✏️ Paket tahrirlash")],
-            [KeyboardButton(text="❌ Paket o‘chirish")],
+            [KeyboardButton(text="❌ Paket o'chirish")],
             [KeyboardButton(text="⬅️ Orqaga")]
         ],
         resize_keyboard=True
@@ -357,7 +357,7 @@ def admin_promocode_menu_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="➕ Promokod yaratish")],
-            [KeyboardButton(text="📊 Promokodlar ro‘yxati")],
+            [KeyboardButton(text="📊 Promokodlar ro'yxati")],
             [KeyboardButton(text="⬅️ Orqaga")]
         ],
         resize_keyboard=True

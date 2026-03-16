@@ -3180,7 +3180,7 @@ async def admin_edit_value_handler(message: Message, state: FSMContext):
 async def admin_panel_handler(message: Message, state: FSMContext):
     await _open_admin_panel(message, state)
 
-@router.message(Command("help"))
+@router.message(Command(commands=["help", "Help"]))
 async def help_handler(message: Message):
     text = (
         '🆘 <b>Yordam markazi</b>\n\n'
@@ -3210,6 +3210,16 @@ async def help_handler(message: Message):
             inline_keyboard=[[InlineKeyboardButton(text='🏠 Asosiy Menyu', callback_data="back_to_menu")]]
         )
     )
+
+
+@router.message(Command(commands=["balance", "Balance"]))
+async def balance_handler(message: Message):
+    text = await build_balance_text(message.from_user.id, message.from_user.first_name)
+    if not text:
+        await message.answer("Foydalanuvchi topilmadi")
+        return
+
+    await message.answer(text, reply_markup=promo_enter_keyboard())
 
 @router.message(AdminMenuStates.menu, F.text == '👥 Foydalanuvchilar soni')
 async def users_stats_menu_handler(message: Message):
@@ -6424,7 +6434,7 @@ async def enter_promocode_handler(callback: CallbackQuery, state: FSMContext):
         "To'g'ri promokod kiritilsa, balansingizga "
         "qo'shimcha 💎 bonus beriladi.\n\n"
         "✍️ <b>Promokod so'zini kiriting</b>\n"
-        "Masalan: <code>ZONIKSBB</code>",
+        "Masalan: <code>NUREKEFF</code>",
         reply_markup=promocode_back_to_menu_keyboard()
     )
 
