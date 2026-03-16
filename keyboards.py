@@ -431,9 +431,9 @@ def broadcast_confirm_keyboard():
 def admin_roles_menu_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="➕ Admin qo‘shish")],
+            [KeyboardButton(text="➕ Admin qo'shish")],
             [KeyboardButton(text="✏️ Admin roli")],
-            [KeyboardButton(text="❌ Admin o‘chirish")],
+            [KeyboardButton(text="❌ Admin o'chirish")],
             [KeyboardButton(text="⬅️ Orqaga")],
         ],
         resize_keyboard=True
@@ -443,11 +443,11 @@ def admin_roles_menu_keyboard():
 def admin_payment_cards_menu_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="➕ Karta qo‘shish")],
+            [KeyboardButton(text="➕ Karta qo'shish")],
             [KeyboardButton(text="✏️ Karta tahrirlash")],
             [KeyboardButton(text="✅ Aktiv qilish")],
-            [KeyboardButton(text="🚫 Aktivni o‘chirish")],
-            [KeyboardButton(text="❌ Karta o‘chirish")],
+            [KeyboardButton(text="🚫 Aktivni o'chirish")],
+            [KeyboardButton(text="❌ Karta o'chirish")],
             [KeyboardButton(text="⬅️ Orqaga")],
         ],
         resize_keyboard=True
@@ -457,8 +457,8 @@ def admin_payment_cards_menu_keyboard():
 def admin_logchat_menu_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🔗 Kanal username o‘rnatish")],
-            [KeyboardButton(text="✅ Yoqish/O‘chirish")],
+            [KeyboardButton(text="🔗 Kanal username o'rnatish")],
+            [KeyboardButton(text="✅ Yoqish/O'chirish")],
             [KeyboardButton(text="🧪 Test yuborish")],
             [KeyboardButton(text="⬅️ Orqaga")],
         ],

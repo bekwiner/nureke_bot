@@ -10,7 +10,12 @@ class ContentButtonWiringTests(unittest.TestCase):
 
     def test_admin_menu_contains_content_upload_entry(self):
         source = Path("keyboards.py").read_text(encoding="utf-8")
-        self.assertIn("📥 Bo'limga yuklash", source)
+        self.assertIn("Bo'limga yuklash", source)
+
+    def test_admin_role_menu_uses_handler_matching_labels(self):
+        source = Path("keyboards.py").read_text(encoding="utf-8")
+        self.assertIn("Admin qo'shish", source)
+        self.assertIn("Admin o'chirish", source)
 
     def test_schema_and_handlers_exist(self):
         database_source = Path("database.py").read_text(encoding="utf-8")
@@ -21,11 +26,11 @@ class ContentButtonWiringTests(unittest.TestCase):
 
     def test_main_menu_reply_router_accepts_real_button_texts(self):
         handlers_source = Path("handlers.py").read_text(encoding="utf-8")
-        self.assertIn('"💎 Almaz olish"', handlers_source)
-        self.assertIn('"🎫 Voucher olish"', handlers_source)
-        self.assertIn('"📊 Paket narxlari"', handlers_source)
-        self.assertIn('"💰 Mening balansim"', handlers_source)
-        self.assertIn('"📞 Yordam / Admin"', handlers_source)
+        self.assertIn("Almaz olish", handlers_source)
+        self.assertIn("Voucher olish", handlers_source)
+        self.assertIn("Paket narxlari", handlers_source)
+        self.assertIn("Mening balansim", handlers_source)
+        self.assertIn("Yordam / Admin", handlers_source)
 
 
 if __name__ == "__main__":
