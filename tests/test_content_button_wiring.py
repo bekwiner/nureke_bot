@@ -19,6 +19,14 @@ class ContentButtonWiringTests(unittest.TestCase):
         self.assertIn("CONTENT_BUTTON_SAVED", handlers_source)
         self.assertIn("user_dynamic_content_button_router", handlers_source)
 
+    def test_main_menu_reply_router_accepts_real_button_texts(self):
+        handlers_source = Path("handlers.py").read_text(encoding="utf-8")
+        self.assertIn('"💎 Almaz olish"', handlers_source)
+        self.assertIn('"🎫 Voucher olish"', handlers_source)
+        self.assertIn('"📊 Paket narxlari"', handlers_source)
+        self.assertIn('"💰 Mening balansim"', handlers_source)
+        self.assertIn('"📞 Yordam / Admin"', handlers_source)
+
 
 if __name__ == "__main__":
     unittest.main()

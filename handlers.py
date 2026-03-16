@@ -1878,6 +1878,11 @@ async def open_buy_voucher_from_message(message: Message, state: FSMContext):
 @router.message(
     F.text.in_(
         {
+            "💎 Almaz olish",
+            "🎫 Voucher olish",
+            "📊 Paket narxlari",
+            "💰 Mening balansim",
+            "📞 Yordam / Admin",
             "?? Almaz olish",
             "?? Voucher olish",
             "?? Paket narxlari",
